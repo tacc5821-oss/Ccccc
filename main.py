@@ -1,861 +1,953 @@
-import os
-import json
+#!/usr/bin/env python3
+"""
+Telegram group "bluff" game bot.
+
+Features:
+- Lobby with Join / Start (max 10, min 3)
+- Sequential nickname registration with a 1-minute timeout per player
+- Random secret Killer with DM control panel (Curse Others, Self Curse, Remove Curse, Fake Alert)
+- Cursed players' group messages are deleted after 0.5s and replaced with "🤐 [Nickname] စကားပြောလို့မရပါ"
+- Vote phase (/vote) with a 2-minute timeout. Tie => Killer wins (no elimination).
+- Eliminated players are marked inactive and cannot be cursed or vote
+- SQLite persistence for games, players, cursed status, and votes
+"""
+
 import asyncio
-from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import logging
+import os
+import random
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 
-# Bot configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN', '7995053218:AAHjjk02qRGrVmrGy-i-xL4vXio7m8bwaE0')
-OWNER_ID = int(os.getenv('OWNER_ID', '1735522859'))
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatMemberStatus
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-class TelegramBot:
-    def __init__(self):
-        self.admin_states = {}
-        self.user_states = {}
-        self.init_data_files()
-    
-    def init_data_files(self):
-        """Initialize JSON data files"""
-        files = {
-            'data/users.json': {},
-            'data/items.json': {},
-            'data/orders.json': [],
-            'data/coupons.json': {}
-        }
-        
-        os.makedirs('data', exist_ok=True)
-        
-        for filepath, default_data in files.items():
-            if not os.path.exists(filepath):
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(default_data, f, ensure_ascii=False, indent=2)
-    
-    def load_json(self, filepath):
-        """Load JSON data"""
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return {}
-    
-    def save_json(self, filepath, data):
-        """Save JSON data"""
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    
-    def is_admin(self, user_id: int) -> bool:
-        """Check if user is admin"""
-        return user_id == OWNER_ID
-    
-    def get_user_keyboard(self):
-        """Get user keyboard"""
-        keyboard = [
-            [KeyboardButton("🛍️ Browse Items"), KeyboardButton("💰 My Balance")],
-            [KeyboardButton("📦 My Orders")]
-        ]
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-    
-    def get_admin_keyboard(self):
-        """Get admin keyboard - Updated Menu"""
-        keyboard = [
-            [KeyboardButton("➕ Add Item"), KeyboardButton("🧭 Manage Item")],
-            [KeyboardButton("👤 View Users"), KeyboardButton("💰 Manage Coins")],
-            [KeyboardButton("📦 View Orders"), KeyboardButton("🏷️ Add Coupon")],
-            [KeyboardButton("🧭 Manage Coupon")]
-        ]
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-    
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        user_id = update.effective_user.id
-        username = update.effective_user.username or "User"
-        
-        welcome_text = f"🎮 Welcome to @{username}\n\n🏪Osamu Gaming Items Store!🏪\n\nSelect an option:"
-        
-        if self.is_admin(user_id):
-            await update.message.reply_text(
-                welcome_text,
-                reply_markup=self.get_admin_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                welcome_text,
-                reply_markup=self.get_user_keyboard()
-            )
-    
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages"""
-        user_id = update.effective_user.id
-        username = update.effective_user.username or f"user_{user_id}"
-        text = update.message.text
-        
-        # Register user if not exists
-        users = self.load_json('data/users.json')
-        if str(user_id) not in users:
-            users[str(user_id)] = {
-                'username': username,
-                'coins': 0,
-                'registered_at': datetime.now().isoformat()
-            }
-            self.save_json('data/users.json', users)
-        
-        if self.is_admin(user_id):
-            await self.handle_admin_messages(update, context, text)
-        else:
-            await self.handle_user_messages(update, context, text)
-    
-    async def handle_admin_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        """Handle admin messages"""
-        user_id = update.effective_user.id
-        
-        # Check if admin is in a state (adding item, coupon, etc.)
-        if user_id in self.admin_states:
-            await self.handle_admin_states(update, context)
-            return
-        
-        # Handle admin buttons
-        if text == "➕ Add Item":
-            self.admin_states[user_id] = {'action': 'add_item', 'step': 'category'}
-            await update.message.reply_text("📝 Enter category (e.g., MLBB, PUBG):")
-        
-        elif text == "🧭 Manage Item":
-            items = self.load_json('data/items.json')
-            if not items:
-                await update.message.reply_text("❌ No items found!")
-                return
-            
-            keyboard = []
-            for item_id, item in items.items():
-                keyboard.append([InlineKeyboardButton(
-                    f"{item['name']} - {item['price']} MMK", 
-                    callback_data=f"manage_item_{item_id}"
-                )])
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text("🧭 Select item to manage:", reply_markup=reply_markup)
-        
-        elif text == "👤 View Users":
-            users = self.load_json('data/users.json')
-            if not users:
-                await update.message.reply_text("❌ No users found!")
-                return
-            
-            keyboard = []
-            for user_id_str, user in users.items():
-                keyboard.append([InlineKeyboardButton(
-                    f"@{user['username']} - {user['coins']} MMK", 
-                    callback_data=f"manage_user_{user_id_str}"
-                )])
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text("👤 Users List:", reply_markup=reply_markup)
-        
-        elif text == "💰 Manage Coins":
-            users = self.load_json('data/users.json')
-            if not users:
-                await update.message.reply_text("❌ No users found!")
-                return
-            
-            keyboard = []
-            for user_id_str, user in users.items():
-                keyboard.append([InlineKeyboardButton(
-                    f"@{user['username']} - {user['coins']} MMK", 
-                    callback_data=f"coins_user_{user_id_str}"
-                )])
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text("💰 Select user to manage coins:", reply_markup=reply_markup)
-        
-        elif text == "📦 View Orders":
-            orders = self.load_json('data/orders.json')
-            pending_orders = [order for order in orders if order.get('status') == 'pending']
-            
-            if not pending_orders:
-                await update.message.reply_text("✅ No pending orders!")
-                return
-            
-            keyboard = []
-            for order in pending_orders:
-                items = self.load_json('data/items.json')
-                item = items.get(order['item_id'], {})
-                users = self.load_json('data/users.json')
-                user = users.get(str(order['user_id']), {})
-                
-                keyboard.append([InlineKeyboardButton(
-                    f"@{user.get('username', 'Unknown')} - {item.get('name', 'Unknown')} - {order.get('total_price', 0)} MMK", 
-                    callback_data=f"order_detail_{order['order_id']}"
-                )])
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text("📦 Pending Orders:", reply_markup=reply_markup)
-        
-        elif text == "🏷️ Add Coupon":
-            self.admin_states[user_id] = {'action': 'add_coupon', 'step': 'code'}
-            await update.message.reply_text("🏷️ Enter coupon code (e.g., NEWYEAR):")
-        
-        elif text == "🧭 Manage Coupon":
-            coupons = self.load_json('data/coupons.json')
-            if not coupons:
-                await update.message.reply_text("❌ No coupons found!")
-                return
-            
-            keyboard = []
-            for code, coupon in coupons.items():
-                keyboard.append([InlineKeyboardButton(
-                    f"{code} - {coupon['discount']} MMK", 
-                    callback_data=f"manage_coupon_{code}"
-                )])
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text("🧭 Select coupon to manage:", reply_markup=reply_markup)
-        
-        else:
-            await update.message.reply_text("Please use the menu buttons or type /start")
-    
-    async def handle_user_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        """Handle user messages"""
-        user_id = update.effective_user.id
-        
-        # Check if user is in a state (applying coupon, etc.)
-        if user_id in self.user_states:
-            await self.handle_user_states(update, context)
-            return
-        
-        # Handle user buttons
-        if text == "🛍️ Browse Items":
-            items = self.load_json('data/items.json')
-            if not items:
-                await update.message.reply_text("❌ No items available!")
-                return
-            
-            # Group items by category
-            categories = {}
-            for item_id, item in items.items():
-                category = item['category']
-                if category not in categories:
-                    categories[category] = []
-                categories[category].append((item_id, item))
-            
-            keyboard = []
-            for category in categories:
-                keyboard.append([InlineKeyboardButton(
-                    f"🎮 {category}", 
-                    callback_data=f"category_{category}"
-                )])
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_user")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text("🛍️ Select category:", reply_markup=reply_markup)
-        
-        elif text == "💰 My Balance":
-            users = self.load_json('data/users.json')
-            user = users.get(str(user_id), {})
-            balance = user.get('coins', 0)
-            await update.message.reply_text(f"💳 Your Balance: {balance} MMK")
-        
-        elif text == "📦 My Orders":
-            orders = self.load_json('data/orders.json')
-            user_orders = [order for order in orders if order['user_id'] == user_id]
-            
-            if not user_orders:
-                await update.message.reply_text("📦 You have no orders yet.")
-                return
-            
-            message = "📦 Your Orders:\n\n"
-            for order in user_orders[-10:]:  # Show last 10 orders
-                items = self.load_json('data/items.json')
-                item = items.get(order['item_id'], {})
-                status_emoji = "✅" if order['status'] == 'confirmed' else "⏳" if order['status'] == 'pending' else "❌"
-                message += f"{status_emoji} {item.get('name', 'Unknown')} - {order.get('total_price', 0)} MMK\n"
-            
-            await update.message.reply_text(message)
-        
-        else:
-            await update.message.reply_text("Please use the menu buttons or type /start")
-    
-    async def handle_admin_states(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin multi-step processes"""
-        user_id = update.effective_user.id
-        state = self.admin_states[user_id]
-        text = update.message.text.strip()
-        
-        if state['action'] == 'add_item':
-            if state['step'] == 'category':
-                state['category'] = text
-                state['step'] = 'name'
-                await update.message.reply_text("📝 Enter item name:")
-            
-            elif state['step'] == 'name':
-                state['name'] = text
-                state['step'] = 'price'
-                await update.message.reply_text("📝 Enter price (MMK):")
-            
-            elif state['step'] == 'price':
-                try:
-                    price = int(text)
-                    if price <= 0:
-                        raise ValueError
-                    state['price'] = price
-                    state['step'] = 'stock'
-                    await update.message.reply_text("📝 Enter stock count:")
-                except ValueError:
-                    await update.message.reply_text("❌ Invalid price. Please enter a positive number:")
-            
-            elif state['step'] == 'stock':
-                try:
-                    stock = int(text)
-                    if stock < 0:
-                        raise ValueError
-                    
-                    # Save item
-                    items = self.load_json('data/items.json')
-                    item_id = f"item_{len(items) + 1}"
-                    
-                    items[item_id] = {
-                        'category': state['category'],
-                        'name': state['name'],
-                        'price': state['price'],
-                        'stock': stock,
-                        'created_at': datetime.now().isoformat()
-                    }
-                    
-                    self.save_json('data/items.json', items)
-                    
-                    await update.message.reply_text(
-                        f"✅ Item Added!\n\n"
-                        f"Category: {state['category']}\n"
-                        f"Name: {state['name']}\n"
-                        f"Price: {state['price']} MMK\n"
-                        f"Stock: {stock}"
-                    )
-                    
-                    del self.admin_states[user_id]
-                    
-                except ValueError:
-                    await update.message.reply_text("❌ Invalid stock. Please enter a valid number:")
-        
-        elif state['action'] == 'add_coupon':
-            if state['step'] == 'code':
-                state['code'] = text.upper()
-                state['step'] = 'discount'
-                await update.message.reply_text("📝 Enter discount amount (MMK):")
-            
-            elif state['step'] == 'discount':
-                try:
-                    discount = int(text)
-                    if discount <= 0:
-                        raise ValueError
-                    
-                    # Save coupon
-                    coupons = self.load_json('data/coupons.json')
-                    coupons[state['code']] = {
-                        'discount': discount,
-                        'created_at': datetime.now().isoformat()
-                    }
-                    
-                    self.save_json('data/coupons.json', coupons)
-                    
-                    await update.message.reply_text(
-                        f"🏷️ Coupon \"{state['code']}\" saved - {discount} MMK discount"
-                    )
-                    
-                    del self.admin_states[user_id]
-                    
-                except ValueError:
-                    await update.message.reply_text("❌ Invalid discount. Please enter a positive number:")
-        
-        elif state['action'] == 'manage_coins':
-            try:
-                amount = int(text)
-                if amount <= 0:
-                    raise ValueError
-                
-                users = self.load_json('data/users.json')
-                target_user_id = state['user_id']
-                
-                if state['operation'] == 'add':
-                    users[target_user_id]['coins'] += amount
-                    operation_text = "added"
-                else:  # remove
-                    users[target_user_id]['coins'] = max(0, users[target_user_id]['coins'] - amount)
-                    operation_text = "removed"
-                
-                self.save_json('data/users.json', users)
-                
-                await update.message.reply_text(
-                    f"✅ Coin updated!\n"
-                    f"@{users[target_user_id]['username']} now has {users[target_user_id]['coins']} MMK"
-                )
-                
-                del self.admin_states[user_id]
-                
-            except ValueError:
-                await update.message.reply_text("❌ Invalid amount. Please enter a positive number:")
-        
-        elif state['action'] == 'edit_item_price':
-            try:
-                new_price = int(text)
-                if new_price <= 0:
-                    raise ValueError
-                
-                items = self.load_json('data/items.json')
-                item_id = state['item_id']
-                
-                if item_id in items:
-                    old_price = items[item_id]['price']
-                    items[item_id]['price'] = new_price
-                    self.save_json('data/items.json', items)
-                    
-                    await update.message.reply_text(
-                        f"✅ Price updated!\n\n"
-                        f"📱 {items[item_id]['name']}\n"
-                        f"💰 Old Price: {old_price} MMK\n"
-                        f"💰 New Price: {new_price} MMK"
-                    )
-                else:
-                    await update.message.reply_text("❌ Item not found!")
-                
-                del self.admin_states[user_id]
-                
-            except ValueError:
-                await update.message.reply_text("❌ Invalid price. Please enter a positive number:")
-        
-        elif state['action'] == 'edit_item_stock':
-            try:
-                new_stock = int(text)
-                if new_stock < 0:
-                    raise ValueError
-                
-                items = self.load_json('data/items.json')
-                item_id = state['item_id']
-                
-                if item_id in items:
-                    old_stock = items[item_id]['stock']
-                    items[item_id]['stock'] = new_stock
-                    self.save_json('data/items.json', items)
-                    
-                    await update.message.reply_text(
-                        f"✅ Stock updated!\n\n"
-                        f"📱 {items[item_id]['name']}\n"
-                        f"📦 Old Stock: {old_stock}\n"
-                        f"📦 New Stock: {new_stock}"
-                    )
-                else:
-                    await update.message.reply_text("❌ Item not found!")
-                
-                del self.admin_states[user_id]
-                
-            except ValueError:
-                await update.message.reply_text("❌ Invalid stock. Please enter a valid number (0 or more):")
-        
-        elif state['action'] == 'edit_coupon_discount':
-            try:
-                new_discount = int(text)
-                if new_discount <= 0:
-                    raise ValueError
-                
-                coupons = self.load_json('data/coupons.json')
-                coupon_code = state['coupon_code']
-                
-                if coupon_code in coupons:
-                    old_discount = coupons[coupon_code]['discount']
-                    coupons[coupon_code]['discount'] = new_discount
-                    self.save_json('data/coupons.json', coupons)
-                    
-                    await update.message.reply_text(
-                        f"✅ Coupon updated!\n\n"
-                        f"🏷️ Code: {coupon_code}\n"
-                        f"💰 Old Discount: {old_discount} MMK\n"
-                        f"💰 New Discount: {new_discount} MMK"
-                    )
-                else:
-                    await update.message.reply_text("❌ Coupon not found!")
-                
-                del self.admin_states[user_id]
-                
-            except ValueError:
-                await update.message.reply_text("❌ Invalid discount. Please enter a positive number:")
-    
-    async def handle_user_states(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle user multi-step processes"""
-        user_id = update.effective_user.id
-        state = self.user_states[user_id]
-        text = update.message.text.strip().upper()
-        
-        if state['action'] == 'apply_coupon':
-            coupons = self.load_json('data/coupons.json')
-            
-            if text in coupons:
-                item_id = state['item_id']
-                discount = coupons[text]['discount']
-                
-                # Process purchase with coupon
-                await self.process_purchase(update, context, item_id, discount)
-                del self.user_states[user_id]
-            else:
-                await update.message.reply_text("❌ Invalid coupon code. Try again or type 'skip':")
-    
-    async def process_purchase(self, update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: str, coupon_discount: int = 0):
-        """Process purchase"""
-        user_id = update.effective_user.id
-        
-        # Load data
-        items = self.load_json('data/items.json')
-        users = self.load_json('data/users.json')
-        orders = self.load_json('data/orders.json')
-        
-        item = items.get(item_id)
-        user = users.get(str(user_id))
-        
-        if not item or not user:
-            await update.message.reply_text("❌ Error processing purchase!")
-            return
-        
-        if item['stock'] <= 0:
-            await update.message.reply_text("❌ Item out of stock!")
-            return
-        
-        total_price = max(0, item['price'] - coupon_discount)
-        
-        if user['coins'] < total_price:
-            await update.message.reply_text(f"❌ Insufficient balance! You need {total_price} MMK but have {user['coins']} MMK")
-            return
-        
-        # Create order
-        order_id = f"order_{len(orders) + 1}"
-        order = {
-            'order_id': order_id,
-            'user_id': user_id,
-            'item_id': item_id,
-            'total_price': total_price,
-            'status': 'pending',
-            'created_at': datetime.now().isoformat()
-        }
-        
-        # Deduct coins and reduce stock
-        users[str(user_id)]['coins'] -= total_price
-        items[item_id]['stock'] -= 1
-        orders.append(order)
-        
-        # Save data
-        self.save_json('data/users.json', users)
-        self.save_json('data/items.json', items)
-        self.save_json('data/orders.json', orders)
-        
-        await update.message.reply_text(
-            f"✅ Order placed successfully!\n\n"
-            f"Item: {item['name']}\n"
-            f"Price: {total_price} MMK\n"
-            f"Order ID: {order_id}\n"
-            f"Status: Pending confirmation"
+import config
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ---------- Database helpers ----------
+def init_db():
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS games (
+            chat_id INTEGER PRIMARY KEY,
+            state TEXT,
+            owner_id INTEGER,
+            registration_index INTEGER,
+            waiting_user_id INTEGER,
+            join_message_id INTEGER,
+            join_message_text TEXT,
+            killer_id INTEGER,
+            vote_message_id INTEGER,
+            vote_deadline INTEGER
         )
-    
-    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle inline button callbacks"""
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        user_id = query.from_user.id
-        
-        if data.startswith("manage_item_"):
-            item_id = data.replace("manage_item_", "")
-            items = self.load_json('data/items.json')
-            item = items.get(item_id)
-            
-            if item:
-                keyboard = [
-                    [InlineKeyboardButton("📝 Edit Price", callback_data=f"edit_price_{item_id}")],
-                    [InlineKeyboardButton("📦 Edit Stock", callback_data=f"edit_stock_{item_id}")],
-                    [InlineKeyboardButton("🗑️ Delete Item", callback_data=f"delete_item_{item_id}")],
-                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")]
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS players (
+            chat_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            nickname TEXT,
+            role TEXT,
+            active INTEGER,
+            PRIMARY KEY (chat_id, user_id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cursed (
+            chat_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY (chat_id, user_id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS votes (
+            chat_id INTEGER,
+            voter_id INTEGER,
+            target_id INTEGER,
+            PRIMARY KEY (chat_id, voter_id)
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+
+def db_get_game_row(chat_id: int) -> Optional[Tuple]:
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT * FROM games WHERE chat_id = ?", (chat_id,))
+    row = cur.fetchone()
+    con.close()
+    return row
+
+
+def db_upsert_game_row(
+    chat_id: int,
+    state: str,
+    owner_id: Optional[int],
+    registration_index: int,
+    waiting_user_id: Optional[int],
+    join_message_id: Optional[int],
+    join_message_text: Optional[str],
+    killer_id: Optional[int],
+    vote_message_id: Optional[int],
+    vote_deadline: Optional[int],
+):
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO games(chat_id, state, owner_id, registration_index, waiting_user_id, join_message_id, join_message_text, killer_id, vote_message_id, vote_deadline)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            state=excluded.state,
+            owner_id=excluded.owner_id,
+            registration_index=excluded.registration_index,
+            waiting_user_id=excluded.waiting_user_id,
+            join_message_id=excluded.join_message_id,
+            join_message_text=excluded.join_message_text,
+            killer_id=excluded.killer_id,
+            vote_message_id=excluded.vote_message_id,
+            vote_deadline=excluded.vote_deadline
+        """,
+        (
+            chat_id,
+            state,
+            owner_id,
+            registration_index,
+            waiting_user_id,
+            join_message_id,
+            join_message_text,
+            killer_id,
+            vote_message_id,
+            vote_deadline,
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def db_delete_game(chat_id: int):
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM games WHERE chat_id = ?", (chat_id,))
+    cur.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
+    cur.execute("DELETE FROM cursed WHERE chat_id = ?", (chat_id,))
+    cur.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
+    con.commit()
+    con.close()
+
+
+def db_upsert_player(chat_id: int, user_id: int, username: str, nickname: Optional[str], role: str, active: bool):
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO players(chat_id, user_id, username, nickname, role, active)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            username=excluded.username,
+            nickname=excluded.nickname,
+            role=excluded.role,
+            active=excluded.active
+        """,
+        (chat_id, user_id, username, nickname, role, int(active)),
+    )
+    con.commit()
+    con.close()
+
+
+def db_get_players(chat_id: int) -> List[Tuple]:
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT user_id, username, nickname, role, active FROM players WHERE chat_id = ? ORDER BY rowid", (chat_id,))
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+
+def db_delete_player(chat_id: int, user_id: int):
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    cur.execute("DELETE FROM cursed WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    cur.execute("DELETE FROM votes WHERE chat_id = ? AND voter_id = ?", (chat_id, user_id))
+    cur.execute("DELETE FROM votes WHERE chat_id = ? AND target_id = ?", (chat_id, user_id))
+    con.commit()
+    con.close()
+
+
+def db_set_cursed(chat_id: int, user_id: int):
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO cursed(chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
+    con.commit()
+    con.close()
+
+
+def db_remove_cursed(chat_id: int, user_id: int):
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM cursed WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    con.commit()
+    con.close()
+
+
+def db_get_cursed_set(chat_id: int) -> Set[int]:
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT user_id FROM cursed WHERE chat_id = ?", (chat_id,))
+    rows = cur.fetchall()
+    con.close()
+    return {r[0] for r in rows}
+
+
+def db_add_vote(chat_id: int, voter_id: int, target_id: int):
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO votes(chat_id, voter_id, target_id) VALUES (?, ?, ?)",
+        (chat_id, voter_id, target_id),
+    )
+    con.commit()
+    con.close()
+
+
+def db_clear_votes(chat_id: int):
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
+    con.commit()
+    con.close()
+
+
+def db_get_votes(chat_id: int) -> Dict[int, int]:
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT voter_id, target_id FROM votes WHERE chat_id = ?", (chat_id,))
+    rows = cur.fetchall()
+    con.close()
+    return {r[0]: r[1] for r in rows}
+
+
+# ---------- In-memory model ----------
+@dataclass
+class Player:
+    user_id: int
+    username: str
+    nickname: Optional[str] = None
+    role: str = "villager"
+    active: bool = True
+
+
+@dataclass
+class Game:
+    chat_id: int
+    state: str = "idle"  # idle, lobby, registration, in_game, voting, ended
+    owner_id: Optional[int] = None
+    players: List[Player] = field(default_factory=list)
+    join_message_id: Optional[int] = None
+    join_message_text: Optional[str] = None
+    waiting_for_nickname_user_id: Optional[int] = None
+    registration_index: int = 0
+    cursed: Set[int] = field(default_factory=set)
+    killer_id: Optional[int] = None
+    vote_message_id: Optional[int] = None
+    vote_deadline: Optional[int] = None
+
+    # runtime-only tasks (not persisted)
+    registration_task: Optional[asyncio.Task] = None
+    voting_task: Optional[asyncio.Task] = None
+
+
+# All active games in memory
+GAMES: Dict[int, Game] = {}
+
+
+# ---------- Utility functions ----------
+def load_game_from_db(chat_id: int) -> Optional[Game]:
+    row = db_get_game_row(chat_id)
+    if not row:
+        return None
+    # row fields: chat_id, state, owner_id, registration_index, waiting_user_id,
+    # join_message_id, join_message_text, killer_id, vote_message_id, vote_deadline
+    _, state, owner_id, reg_idx, waiting_user_id, join_msg_id, join_msg_text, killer_id, vote_msg_id, vote_deadline = row
+    g = Game(chat_id=chat_id)
+    g.state = state
+    g.owner_id = owner_id
+    g.registration_index = reg_idx or 0
+    g.waiting_for_nickname_user_id = waiting_user_id
+    g.join_message_id = join_msg_id
+    g.join_message_text = join_msg_text
+    g.killer_id = killer_id
+    g.vote_message_id = vote_msg_id
+    g.vote_deadline = vote_deadline
+    # load players
+    rows = db_get_players(chat_id)
+    for user_id, username, nickname, role, active in rows:
+        g.players.append(Player(user_id=user_id, username=username, nickname=nickname, role=role, active=bool(active)))
+    # cursed
+    g.cursed = db_get_cursed_set(chat_id)
+    return g
+
+
+def save_game_to_db(game: Game):
+    vote_deadline = game.vote_deadline
+    db_upsert_game_row(
+        chat_id=game.chat_id,
+        state=game.state,
+        owner_id=game.owner_id,
+        registration_index=game.registration_index,
+        waiting_user_id=game.waiting_for_nickname_user_id,
+        join_message_id=game.join_message_id,
+        join_message_text=game.join_message_text,
+        killer_id=game.killer_id,
+        vote_message_id=game.vote_message_id,
+        vote_deadline=vote_deadline,
+    )
+    # players
+    for p in game.players:
+        db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
+    # cursed set
+    # clear existing then insert current
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM cursed WHERE chat_id = ?", (game.chat_id,))
+    for uid in game.cursed:
+        cur.execute("INSERT OR IGNORE INTO cursed(chat_id, user_id) VALUES (?, ?)", (game.chat_id, uid))
+    con.commit()
+    con.close()
+
+
+def remove_player_from_game(game: Game, user_id: int):
+    # mark inactive in memory and DB
+    for p in game.players:
+        if p.user_id == user_id:
+            p.active = False
+            db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
+            break
+    # remove votes referencing them
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM votes WHERE chat_id = ? AND voter_id = ?", (game.chat_id, user_id))
+    cur.execute("DELETE FROM votes WHERE chat_id = ? AND target_id = ?", (game.chat_id, user_id))
+    con.commit()
+    con.close()
+
+
+def active_players(game: Game) -> List[Player]:
+    return [p for p in game.players if p.active]
+
+
+def player_by_user_id(game: Game, user_id: int) -> Optional[Player]:
+    return next((p for p in game.players if p.user_id == user_id), None)
+
+
+def active_villagers_count(game: Game) -> int:
+    return sum(1 for p in game.players if p.active and p.role != "killer")
+
+
+def active_killers_count(game: Game) -> int:
+    return sum(1 for p in game.players if p.active and p.role == "killer")
+
+
+# ---------- Bot command & callback handlers ----------
+async def start_game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("This command only works in groups.")
+        return
+
+    # check admin
+    member = await context.bot.get_chat_member(chat.id, user.id)
+    if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        await update.message.reply_text("Only group Admin/Owner can start a game.")
+        return
+
+    # Create new game or reset existing
+    game = GAMES.get(chat.id)
+    if not game:
+        game = load_game_from_db(chat.id) or Game(chat_id=chat.id)
+        GAMES[chat.id] = game
+
+    if game.state not in ("idle", "ended"):
+        await update.message.reply_text("A game is already running in this chat.")
+        return
+
+    # initialize
+    game.state = "lobby"
+    game.owner_id = user.id
+    game.players = []
+    game.cursed = set()
+    game.registration_index = 0
+    game.waiting_for_nickname_user_id = None
+    game.killer_id = None
+    game.vote_message_id = None
+    game.vote_deadline = None
+    # persist
+    save_game_to_db(game)
+
+    text = "ဂိမ်းကစားမည့်သူများ - Join 🙋‍♂️\n(အများဆုံး 10 ယောက်၊ အနည်းဆုံး 3 ယောက်လိုအပ်ပါသည်)"
+    join_button = InlineKeyboardButton("Join 🙋‍♂️", callback_data="join")
+    start_button = InlineKeyboardButton("Start Game 🚀", callback_data="start_game")
+    kb = InlineKeyboardMarkup([[join_button, start_button]])
+    sent = await update.message.reply_text(text, reply_markup=kb)
+    game.join_message_id = sent.message_id
+    game.join_message_text = text
+    save_game_to_db(game)
+    await update.message.reply_text("Lobby opened. Players, press Join 🙋‍♂️")
+
+
+async def join_or_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    chat = query.message.chat
+    game = GAMES.get(chat.id) or (load_game_from_db(chat.id) or Game(chat_id=chat.id))
+    GAMES[chat.id] = game
+
+    if game.state != "lobby":
+        await query.answer(text="Lobby is not active.")
+        return
+
+    if query.data == "join":
+        if player_by_user_id(game, user.id):
+            await query.answer(text="You already joined.")
+            return
+        if len(game.players) >= 10:
+            await query.answer(text="Lobby is full.")
+            return
+        username = user.username or (user.first_name or f"user{user.id}")
+        p = Player(user_id=user.id, username=username)
+        game.players.append(p)
+        db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
+        save_game_to_db(game)
+        count = len(game.players)
+        new_text = f"ဂိမ်းကစားမည့်သူများ - {count} joined\n(အများဆုံး 10 ယောက်၊ အနည်းဆုံး 3 ယောက်လိုအပ်ပါသည်)"
+        if count >= 10:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Full (10)", callback_data="noop")]])
+        else:
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Join 🙋‍♂️", callback_data="join"),
+                        InlineKeyboardButton("Start Game 🚀", callback_data="start_game"),
+                    ]
                 ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    f"🧭 Managing: {item['name']}\n"
-                    f"Category: {item['category']}\n"
-                    f"Price: {item['price']} MMK\n"
-                    f"Stock: {item['stock']}\n\n"
-                    f"Select action:",
-                    reply_markup=reply_markup
-                )
-        
-        elif data.startswith("coins_user_"):
-            user_id_str = data.replace("coins_user_", "")
-            users = self.load_json('data/users.json')
-            user = users.get(user_id_str)
-            
-            if user:
-                keyboard = [
-                    [InlineKeyboardButton("➕ Add Coins", callback_data=f"add_coins_{user_id_str}")],
-                    [InlineKeyboardButton("➖ Remove Coins", callback_data=f"remove_coins_{user_id_str}")],
-                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    f"💰 Manage Coins for @{user['username']}\n"
-                    f"Current Balance: {user['coins']} MMK\n\n"
-                    f"Select action:",
-                    reply_markup=reply_markup
-                )
-        
-        elif data.startswith("add_coins_") or data.startswith("remove_coins_"):
-            operation = "add" if data.startswith("add_coins_") else "remove"
-            user_id_str = data.replace(f"{operation}_coins_", "")
-            
-            self.admin_states[user_id] = {
-                'action': 'manage_coins',
-                'operation': operation,
-                'user_id': user_id_str
-            }
-            
-            await query.edit_message_text(f"Enter amount to {operation}:")
-        
-        elif data.startswith("order_detail_"):
-            order_id = data.replace("order_detail_", "")
-            orders = self.load_json('data/orders.json')
-            
-            order = next((o for o in orders if o['order_id'] == order_id), None)
-            if order:
-                items = self.load_json('data/items.json')
-                users = self.load_json('data/users.json')
-                item = items.get(order['item_id'], {})
-                user = users.get(str(order['user_id']), {})
-                
-                keyboard = [
-                    [InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_order_{order_id}")],
-                    [InlineKeyboardButton("❌ Reject", callback_data=f"reject_order_{order_id}")],
-                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    f"📦 Order Details\n\n"
-                    f"Order ID: {order_id}\n"
-                    f"User: @{user.get('username', 'Unknown')}\n"
-                    f"Item: {item.get('name', 'Unknown')}\n"
-                    f"Price: {order.get('total_price', 0)} MMK\n"
-                    f"Status: {order.get('status', 'Unknown')}\n\n"
-                    f"Select action:",
-                    reply_markup=reply_markup
-                )
-        
-        elif data.startswith("confirm_order_") or data.startswith("reject_order_"):
-            action = "confirmed" if data.startswith("confirm_order_") else "rejected"
-            order_id = data.replace(f"{action.split('ed')[0]}_order_", "")
-            
-            orders = self.load_json('data/orders.json')
-            
-            for order in orders:
-                if order['order_id'] == order_id:
-                    order['status'] = action
-                    break
-            
-            self.save_json('data/orders.json', orders)
-            
-            await query.edit_message_text(f"✅ Order {order_id} has been {action}!")
-        
-        # Add more callback handlers for user side (Browse Items, Buy, etc.)
-        elif data.startswith("category_"):
-            category = data.replace("category_", "")
-            items = self.load_json('data/items.json')
-            
-            # Filter items by category
-            category_items = {k: v for k, v in items.items() if v['category'] == category}
-            
-            keyboard = []
-            for item_id, item in category_items.items():
-                stock_text = f"(Stock: {item['stock']})" if item['stock'] > 0 else "(Out of Stock)"
-                keyboard.append([InlineKeyboardButton(
-                    f"{item['name']} - {item['price']} MMK {stock_text}", 
-                    callback_data=f"item_{item_id}"
-                )])
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_user")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(f"🎮 {category} Items:", reply_markup=reply_markup)
-        
-        elif data.startswith("item_"):
-            item_id = data.replace("item_", "")
-            items = self.load_json('data/items.json')
-            item = items.get(item_id)
-            
-            if item:
-                keyboard = []
-                if item['stock'] > 0:
-                    keyboard.append([InlineKeyboardButton("💳 Buy Now", callback_data=f"buy_{item_id}")])
-                    keyboard.append([InlineKeyboardButton("🏷️ Use Coupon", callback_data=f"coupon_{item_id}")])
-                keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"category_{item['category']}")])
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    f"🎮 {item['name']}\n\n"
-                    f"💰 Price: {item['price']} MMK\n"
-                    f"📦 Stock: {item['stock']}\n"
-                    f"🏷️ Category: {item['category']}\n\n"
-                    f"{'✅ Available' if item['stock'] > 0 else '❌ Out of Stock'}",
-                    reply_markup=reply_markup
-                )
-        
-        elif data.startswith("buy_"):
-            item_id = data.replace("buy_", "")
-            await self.process_purchase(update, context, item_id)
-            await query.edit_message_text("🔄 Processing your order...")
-        
-        elif data.startswith("coupon_"):
-            item_id = data.replace("coupon_", "")
-            self.user_states[user_id] = {
-                'action': 'apply_coupon',
-                'item_id': item_id
-            }
-            await query.edit_message_text("🏷️ Enter coupon code (or type 'skip' to buy without coupon):")
-        
-        # Admin-specific callback handlers for managing items
-        elif data.startswith("edit_price_"):
-            item_id = data.replace("edit_price_", "")
-            self.admin_states[user_id] = {
-                'action': 'edit_item_price',
-                'item_id': item_id
-            }
-            await query.edit_message_text("📝 Enter new price (MMK):")
-        
-        elif data.startswith("edit_stock_"):
-            item_id = data.replace("edit_stock_", "")
-            self.admin_states[user_id] = {
-                'action': 'edit_item_stock',
-                'item_id': item_id
-            }
-            await query.edit_message_text("📝 Enter new stock quantity:")
-        
-        elif data.startswith("delete_item_"):
-            item_id = data.replace("delete_item_", "")
-            items = self.load_json('data/items.json')
-            item = items.get(item_id)
-            
-            if item:
-                keyboard = [
-                    [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_item_{item_id}")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data=f"manage_item_{item_id}")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    f"🗑️ Are you sure you want to delete:\n\n"
-                    f"📱 {item['name']}\n"
-                    f"💰 {item['price']} MMK\n"
-                    f"📦 Stock: {item['stock']}\n\n"
-                    f"This action cannot be undone!",
-                    reply_markup=reply_markup
-                )
-        
-        elif data.startswith("confirm_delete_item_"):
-            item_id = data.replace("confirm_delete_item_", "")
-            items = self.load_json('data/items.json')
-            
-            if item_id in items:
-                item_name = items[item_id]['name']
-                del items[item_id]
-                self.save_json('data/items.json', items)
-                
-                await query.edit_message_text(f"✅ Item '{item_name}' has been deleted successfully!")
-            else:
-                await query.edit_message_text("❌ Item not found!")
-        
-        # Admin-specific callback handlers for managing coupons
-        elif data.startswith("manage_coupon_"):
-            coupon_code = data.replace("manage_coupon_", "")
-            coupons = self.load_json('data/coupons.json')
-            coupon = coupons.get(coupon_code)
-            
-            if coupon:
-                keyboard = [
-                    [InlineKeyboardButton("📝 Edit Discount", callback_data=f"edit_coupon_{coupon_code}")],
-                    [InlineKeyboardButton("🗑️ Delete Coupon", callback_data=f"delete_coupon_{coupon_code}")],
-                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    f"🧭 Managing Coupon: {coupon_code}\n"
-                    f"💰 Discount: {coupon['discount']} MMK\n\n"
-                    f"Select action:",
-                    reply_markup=reply_markup
-                )
-        
-        elif data.startswith("edit_coupon_"):
-            coupon_code = data.replace("edit_coupon_", "")
-            self.admin_states[user_id] = {
-                'action': 'edit_coupon_discount',
-                'coupon_code': coupon_code
-            }
-            await query.edit_message_text("📝 Enter new discount amount (MMK):")
-        
-        elif data.startswith("delete_coupon_"):
-            coupon_code = data.replace("delete_coupon_", "")
-            coupons = self.load_json('data/coupons.json')
-            coupon = coupons.get(coupon_code)
-            
-            if coupon:
-                keyboard = [
-                    [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_coupon_{coupon_code}")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data=f"manage_coupon_{coupon_code}")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    f"🗑️ Are you sure you want to delete coupon:\n\n"
-                    f"🏷️ Code: {coupon_code}\n"
-                    f"💰 Discount: {coupon['discount']} MMK\n\n"
-                    f"This action cannot be undone!",
-                    reply_markup=reply_markup
-                )
-        
-        elif data.startswith("confirm_delete_coupon_"):
-            coupon_code = data.replace("confirm_delete_coupon_", "")
-            coupons = self.load_json('data/coupons.json')
-            
-            if coupon_code in coupons:
-                del coupons[coupon_code]
-                self.save_json('data/coupons.json', coupons)
-                
-                await query.edit_message_text(f"✅ Coupon '{coupon_code}' has been deleted successfully!")
-            else:
-                await query.edit_message_text("❌ Coupon not found!")
-        
-        # Handle Back buttons
-        elif data == "back_admin":
-            await query.edit_message_text("🔙 Returned to main menu. Use the keyboard buttons below.")
-        
-        elif data == "back_user":
-            await query.edit_message_text("🔙 Returned to main menu. Use the keyboard buttons below.")
-        
-        # Handle category back navigation for users
-        elif data.startswith("category_") and not data.startswith("category_back_"):
-            # This is handled above in the category selection
+            )
+        try:
+            await query.edit_message_text(new_text, reply_markup=kb)
+            game.join_message_text = new_text
+            game.join_message_id = query.message.message_id
+            save_game_to_db(game)
+        except Exception:
             pass
-    
-    def run(self):
-        """Start the bot"""
-        print("Bot starting...")
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        # Add handlers
-        application.add_handler(CommandHandler("start", self.start_command))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        application.add_handler(CallbackQueryHandler(self.handle_callback_query))
-        
-        # Start the bot
-        application.run_polling(drop_pending_updates=True)
+        await query.answer(text=f"Joined as @{p.username}")
+
+    elif query.data == "start_game":
+        # verify admin
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            await query.answer(text="Only Admin/Owner can start the game.")
+            return
+        if len(game.players) < 3:
+            await query.answer(text="At least 3 players are required to start.")
+            return
+        # move to registration
+        game.state = "registration"
+        save_game_to_db(game)
+        await query.edit_message_text("Registration started. Bot will ask for nicknames one-by-one.")
+        # begin sequential nickname registration
+        await ask_next_nickname(context, game)
+
+
+async def ask_next_nickname(context: ContextTypes.DEFAULT_TYPE, game: Game):
+    # If registration finished
+    while game.registration_index < len(game.players) and not game.players[game.registration_index].active:
+        game.registration_index += 1
+
+    if game.registration_index >= len(game.players):
+        await finish_registration(context, game)
+        return
+
+    player = game.players[game.registration_index]
+    chat_id = game.chat_id
+    mention = f"@{player.username}"
+    sent = await context.bot.send_message(chat_id=chat_id, text=f"{mention} ကျေးဇူးပြု၍ Nickname ပို့ပါ။")
+    game.waiting_for_nickname_user_id = player.user_id
+    save_game_to_db(game)
+
+    # schedule timeout for this player's nickname
+    if game.registration_task and not game.registration_task.done():
+        game.registration_task.cancel()
+    game.registration_task = asyncio.create_task(registration_timeout(context, game.chat_id, player.user_id))
+
+
+async def registration_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    await asyncio.sleep(config.NICKNAME_TIMEOUT)
+    game = GAMES.get(chat_id)
+    if not game:
+        return
+    if game.state != "registration":
+        return
+    if game.waiting_for_nickname_user_id != user_id:
+        return
+    # timeout: remove the user from game (mark inactive) and continue
+    player = player_by_user_id(game, user_id)
+    if player:
+        player.active = False
+        db_upsert_player(chat_id, player.user_id, player.username, player.nickname, player.role, player.active)
+    # notify group
+    await context.bot.send_message(chat_id, f"@{player.username} က nickname မပေးသေးလို့ အလိုမရှိသွားပါပြီ။")
+    # advance
+    game.registration_index += 1
+    game.waiting_for_nickname_user_id = None
+    save_game_to_db(game)
+    # If too few players remain, abort
+    if len(active_players(game)) < 3:
+        await context.bot.send_message(chat_id, "Players fewer than 3 after timeouts. Lobby closed.")
+        game.state = "ended"
+        save_game_to_db(game)
+        return
+    # ask next
+    await ask_next_nickname(context, game)
+
+
+async def finish_registration(context: ContextTypes.DEFAULT_TYPE, game: Game):
+    # ensure all players have nickname; default to username if missing
+    for p in game.players:
+        if not p.nickname:
+            p.nickname = p.username
+            db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
+
+    # assign killer
+    alive_players = [p for p in game.players if p.active]
+    killer_player = random.choice(alive_players)
+    killer_player.role = "killer"
+    game.killer_id = killer_player.user_id
+    # persist roles
+    for p in game.players:
+        db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
+    game.state = "in_game"
+    game.waiting_for_nickname_user_id = None
+    game.registration_index = len(game.players)
+    save_game_to_db(game)
+    await context.bot.send_message(game.chat_id, "ဂိမ်းစပါပြီ")
+    # send killer panel DM
+    try:
+        await send_killer_panel(context, killer_player.user_id, game)
+    except Exception as e:
+        logger.exception("Failed to send killer panel DM: %s", e)
+        await context.bot.send_message(game.chat_id, "Failed to send killer control panel to killer. Ensure killer has opened DM with the bot.")
+
+
+async def send_killer_panel(context: ContextTypes.DEFAULT_TYPE, killer_user_id: int, game: Game):
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Curse Others", callback_data=f"panel_curse_others:{game.chat_id}")],
+            [InlineKeyboardButton("Self Curse", callback_data=f"panel_self_curse:{game.chat_id}")],
+            [InlineKeyboardButton("Remove Curse", callback_data=f"panel_remove_curse:{game.chat_id}")],
+            [InlineKeyboardButton("Fake Alert", callback_data=f"panel_fake_alert:{game.chat_id}")],
+        ]
+    )
+    await context.bot.send_message(
+        chat_id=killer_user_id,
+        text=(
+            "You are the Killer. Use the buttons below to act covertly.\n\n"
+            "- Curse Others: pick a player to curse (their messages will be deleted and replaced in group)\n"
+            "- Self Curse: curse yourself to bluff\n"
+            "- Remove Curse: uncurse a currently cursed player\n"
+            "- Fake Alert: send a 'Curse မိပြီ' message to the group without cursing anyone\n\n(Buttons will open additional choices when needed.)"
+        ),
+        reply_markup=kb,
+    )
+
+
+async def callback_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = query.from_user
+
+    # Panel: choose others to curse
+    if data.startswith("panel_curse_others:"):
+        chat_id = int(data.split(":", 1)[1])
+        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
+        if not game or game.killer_id != user.id:
+            await query.answer(text="Only killer can use this.", show_alert=True)
+            return
+        buttons = []
+        for p in game.players:
+            if p.user_id == user.id or not p.active:
+                continue
+            buttons.append([InlineKeyboardButton(p.nickname or p.username, callback_data=f"curse:{chat_id}:{p.user_id}")])
+        if not buttons:
+            buttons = [[InlineKeyboardButton("No valid targets", callback_data="noop")]]
+        kb = InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Cancel", callback_data="panel_cancel")]])
+        await query.edit_message_text("Select player to curse:", reply_markup=kb)
+
+    elif data.startswith("curse:"):
+        _, chat_id_str, target_id_str = data.split(":")
+        chat_id = int(chat_id_str)
+        target_id = int(target_id_str)
+        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
+        if not game or game.killer_id != user.id:
+            await query.answer(text="Only killer can do that.", show_alert=True)
+            return
+        target = player_by_user_id(game, target_id)
+        if target and target.active:
+            game.cursed.add(target_id)
+            db_set_cursed(chat_id, target_id)
+            save_game_to_db(game)
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ Killer က တစ်ယောက်ကို နှောက်ယှက်လိုက်ပါပြီ!")
+            await query.edit_message_text("Cursed.")
+            logger.info("Killer %s cursed %s in chat %s", user.id, target_id, chat_id)
+        else:
+            await query.answer(text="Invalid target", show_alert=True)
+
+    elif data.startswith("panel_self_curse:"):
+        chat_id = int(data.split(":", 1)[1])
+        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
+        if not game or game.killer_id != user.id:
+            await query.answer(text="Only killer can use this.", show_alert=True)
+            return
+        game.cursed.add(user.id)
+        db_set_cursed(chat_id, user.id)
+        save_game_to_db(game)
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Killer က တစ်ယောက်ကို နှောက်ယှက်လိုက်ပါပြ���!")
+        await query.edit_message_text("You cursed yourself (Self Curse).")
+        logger.info("Killer %s self-cursed in chat %s", user.id, chat_id)
+
+    elif data.startswith("panel_remove_curse:"):
+        chat_id = int(data.split(":", 1)[1])
+        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
+        if not game or game.killer_id != user.id:
+            await query.answer(text="Only killer can use this.", show_alert=True)
+            return
+        if not game.cursed:
+            await query.edit_message_text("There are no cursed players currently.")
+            return
+        buttons = []
+        for uid in list(game.cursed):
+            p = player_by_user_id(game, uid)
+            if not p:
+                continue
+            buttons.append([InlineKeyboardButton(p.nickname or p.username, callback_data=f"remove_curse:{chat_id}:{uid}")])
+        buttons.append([InlineKeyboardButton("Cancel", callback_data="panel_cancel")])
+        kb = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text("Select cursed player to remove curse:", reply_markup=kb)
+
+    elif data.startswith("remove_curse:"):
+        _, chat_id_str, target_id_str = data.split(":")
+        chat_id = int(chat_id_str)
+        target_id = int(target_id_str)
+        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
+        if not game or game.killer_id != user.id:
+            await query.answer(text="Only killer can use this.", show_alert=True)
+            return
+        if target_id in game.cursed:
+            game.cursed.remove(target_id)
+            db_remove_cursed(chat_id, target_id)
+            save_game_to_db(game)
+            await query.edit_message_text("Removed curse.")
+            logger.info("Killer %s removed curse from %s in chat %s", user.id, target_id, chat_id)
+        else:
+            await query.answer(text="That player is not cursed.", show_alert=True)
+
+    elif data.startswith("panel_fake_alert:"):
+        chat_id = int(data.split(":", 1)[1])
+        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
+        if not game or game.killer_id != user.id:
+            await query.answer(text="Only killer can use this.", show_alert=True)
+            return
+        await context.bot.send_message(chat_id=chat_id, text="Curse မိပြီ")
+        await query.edit_message_text("Fake alert sent to group.")
+        logger.info("Killer %s sent fake alert in chat %s", user.id, chat_id)
+
+    elif data == "panel_cancel" or data == "noop":
+        try:
+            await query.delete_message()
+        except Exception:
+            await query.answer()
+
+    elif data.startswith("vote:"):
+        _, chat_id_str, target_id_str = data.split(":")
+        chat_id = int(chat_id_str)
+        target_id = int(target_id_str)
+        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
+        voter_id = user.id
+        vp = player_by_user_id(game, voter_id)
+        if not vp or not vp.active:
+            await query.answer(text="You are not an active player and cannot vote.", show_alert=True)
+            return
+        # check if already voted
+        votes = db_get_votes(chat_id)
+        if voter_id in votes:
+            await query.answer(text="You already voted.", show_alert=True)
+            return
+        db_add_vote(chat_id, voter_id, target_id)
+        await query.answer(text=f"Your vote recorded.")
+        logger.info("User %s voted for %s in chat %s", voter_id, target_id, chat_id)
+        # If all active players have voted, tally now
+        votes = db_get_votes(chat_id)
+        if len(votes) >= len(active_players(game)):
+            # cancel voting timeout
+            if game.voting_task and not game.voting_task.done():
+                game.voting_task.cancel()
+            await tally_votes(context, game)
+
+
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat = message.chat
+    user = message.from_user
+    if chat.type not in ("group", "supergroup"):
+        return
+    game = GAMES.get(chat.id) or load_game_from_db(chat.id)
+    if not game:
+        return
+    GAMES[chat.id] = game
+
+    # registration flow: accept nickname from expected user
+    if game.state == "registration" and game.waiting_for_nickname_user_id:
+        if user.id == game.waiting_for_nickname_user_id:
+            text = (message.text or "").strip()
+            if not text:
+                await message.reply_text("Nickname cannot be empty. Please send a text nickname.")
+                return
+            player = player_by_user_id(game, user.id)
+            if player:
+                player.nickname = text
+                db_upsert_player(game.chat_id, player.user_id, player.username, player.nickname, player.role, player.active)
+                # cancel registration timeout
+                if game.registration_task and not game.registration_task.done():
+                    game.registration_task.cancel()
+                    game.registration_task = None
+                game.registration_index += 1
+                game.waiting_for_nickname_user_id = None
+                save_game_to_db(game)
+                await message.reply_text(f"Saved nickname: {text}")
+                await ask_next_nickname(context, game)
+                return
+        else:
+            # ignore messages from others during registration
+            return
+
+    # in-game: handle cursed deletion
+    if game.state in ("in_game", "voting"):
+        p = player_by_user_id(game, user.id)
+        if p and p.active and user.id in game.cursed:
+            nickname = p.nickname or p.username
+            # schedule delete and replacement
+            asyncio.create_task(handle_cursed_message(context, chat.id, message.message_id, nickname))
+            return
+
+
+async def handle_cursed_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, nickname: str):
+    await asyncio.sleep(config.CURSE_DELETE_DELAY)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.debug("Failed to delete cursed message: %s", e)
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=f"🤐 {nickname} စကားပြောလို့မရပါ")
+    except Exception as e:
+        logger.debug("Failed to send replacement message: %s", e)
+
+
+# Vote command: initiate voting phase
+async def vote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use /vote in the group chat where the game is running.")
+        return
+    game = GAMES.get(chat.id) or load_game_from_db(chat.id)
+    if not game:
+        await update.message.reply_text("No active game in this chat.")
+        return
+    if game.state != "in_game":
+        await update.message.reply_text("Voting can only start during the game.")
+        return
+    # create buttons for active players
+    buttons = []
+    for p in game.players:
+        if p.active:
+            buttons.append([InlineKeyboardButton(p.nickname or p.username, callback_data=f"vote:{chat.id}:{p.user_id}")])
+    if not buttons:
+        await update.message.reply_text("No active players to vote for.")
+        return
+    kb = InlineKeyboardMarkup(buttons)
+    sent = await update.message.reply_text("Vote for who you suspect is the Killer:", reply_markup=kb)
+    game.vote_message_id = sent.message_id
+    game.state = "voting"
+    game.vote_deadline = int(time.time()) + config.VOTE_TIMEOUT
+    save_game_to_db(game)
+    # schedule vote timeout
+    if game.voting_task and not game.voting_task.done():
+        game.voting_task.cancel()
+    game.voting_task = asyncio.create_task(vote_timeout_task(context, game.chat_id))
+    await update.message.reply_text(f"Voting started. You have {config.VOTE_TIMEOUT} seconds.")
+
+
+async def vote_timeout_task(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    await asyncio.sleep(config.VOTE_TIMEOUT)
+    game = GAMES.get(chat_id) or load_game_from_db(chat_id)
+    if not game:
+        return
+    if game.state != "voting":
+        return
+    await context.bot.send_message(chat_id, "Voting time ended. Tallying votes...")
+    await tally_votes(context, game)
+
+
+async def tally_votes(context: ContextTypes.DEFAULT_TYPE, game: Game):
+    chat_id = game.chat_id
+    votes = db_get_votes(chat_id)
+    if not votes:
+        await context.bot.send_message(chat_id, "No votes were cast. No one is executed.")
+        # return to in_game
+        game.state = "in_game"
+        db_clear_votes(chat_id)
+        save_game_to_db(game)
+        return
+    # tally counts
+    tally: Dict[int, int] = {}
+    for voter, target in votes.items():
+        tally[target] = tally.get(target, 0) + 1
+    # determine top
+    top_count = max(tally.values())
+    top_candidates = [uid for uid, cnt in tally.items() if cnt == top_count]
+    # Tie rule: If tie, no one eliminated and Killer wins (game ends with killer victory)
+    if len(top_candidates) > 1:
+        # reveal killer
+        killer_player = player_by_user_id(game, game.killer_id) if game.killer_id else None
+        killer_nick = killer_player.nickname if killer_player else "Killer"
+        await context.bot.send_message(chat_id, f"မဲတူနေမှုဖြစ်နေပါသည်။ Killer အနိုင်ရပါသည်။ Killer: {killer_nick}. ဂိမ်းပြီးပါပြီ။")
+        game.state = "ended"
+        db_clear_votes(chat_id)
+        save_game_to_db(game)
+        return
+
+    top_user_id = top_candidates[0]
+    target_player = player_by_user_id(game, top_user_id)
+    if not target_player:
+        await context.bot.send_message(chat_id, "Error resolving voted player.")
+        game.state = "in_game"
+        db_clear_votes(chat_id)
+        save_game_to_db(game)
+        return
+
+    # If top is killer -> villagers win
+    if target_player.role == "killer":
+        await context.bot.send_message(chat_id, f"မိသွားပါပြီ! {target_player.nickname} သည် Killer ဖြစ်သည်။ ဂိမ်းပြီးပါပြီ။")
+        game.state = "ended"
+        db_clear_votes(chat_id)
+        save_game_to_db(game)
+        return
+    else:
+        # wrong catch: eliminate the player
+        target_player.active = False
+        db_upsert_player(chat_id, target_player.user_id, target_player.username, target_player.nickname, target_player.role, target_player.active)
+        db_remove_cursed(chat_id, target_player.user_id)
+        await context.bot.send_message(chat_id, f"မှားယွင်းဖမ်းဆီးမိသည်။ {target_player.nickname} သည် ဂိမ်းမှ ထွက်ရမည်။")
+        db_clear_votes(chat_id)
+        save_game_to_db(game)
+        # Check win condition: if villagers count equals killers -> killer wins
+        villagers = active_villagers_count(game)
+        killers = active_killers_count(game)
+        if killers >= villagers:
+            killer_player = player_by_user_id(game, game.killer_id) if game.killer_id else None
+            killer_nick = killer_player.nickname if killer_player else "Killer"
+            await context.bot.send_message(chat_id, f"Killer အနိုင်ရပါပြီ။ Killer: {killer_nick}. ဂိမ်းပြီးပါပြီ။")
+            game.state = "ended"
+            save_game_to_db(game)
+            return
+        # otherwise continue game
+        game.state = "in_game"
+        save_game_to_db(game)
+        return
+
+
+# ---------- Startup / helpers ----------
+async def on_startup(application: Application):
+    logger.info("Bot starting up.")
+    init_db()
+    # Load incomplete games into memory
+    con = sqlite3.connect(config.DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT chat_id FROM games WHERE state IN ('lobby','registration','in_game','voting')")
+    rows = cur.fetchall()
+    con.close()
+    for (chat_id,) in rows:
+        g = load_game_from_db(chat_id)
+        if g:
+            GAMES[chat_id] = g
+            logger.info("Loaded game from DB for chat %s state=%s", chat_id, g.state)
+            # If a game was in voting state and the vote_deadline has passed, tally immediately
+            if g.state == "voting":
+                if g.vote_deadline and int(time.time()) >= g.vote_deadline:
+                    # schedule immediate tally
+                    asyncio.create_task(tally_votes(application.bot, g))
+                else:
+                    # schedule remaining vote timeout
+                    remaining = (g.vote_deadline or 0) - int(time.time())
+                    if remaining > 0:
+                        g.voting_task = asyncio.create_task(vote_timeout_task(application, chat_id))
+            # If registration waiting, schedule remaining registration timeout
+            if g.state == "registration" and g.waiting_for_nickname_user_id:
+                # schedule fresh timeout (we don't have per-player time left persisted), using full timeout
+                g.registration_task = asyncio.create_task(registration_timeout(application, chat_id, g.waiting_for_nickname_user_id))
+
+
+def main():
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        logger.error("Please set TELEGRAM_TOKEN environment variable.")
+        return
+    application = Application.builder().token(token).build()
+
+    # Handlers
+    application.add_handler(CommandHandler("start_game", start_game_cmd))
+    application.add_handler(CommandHandler("vote", vote_command))
+    application.add_handler(CallbackQueryHandler(join_or_start_callback, pattern="^(join|start_game)$"))
+    application.add_handler(CallbackQueryHandler(callback_dispatcher, pattern="^"))
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ALL, group_message_handler))
+
+    application.post_init = on_startup
+
+    logger.info("Running bot (polling)...")
+    application.run_polling()
+
 
 if __name__ == "__main__":
-    bot = TelegramBot()
-    bot.run()
+    main()
