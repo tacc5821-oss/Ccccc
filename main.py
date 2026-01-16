@@ -1,953 +1,697 @@
-#!/usr/bin/env python3
-"""
-Telegram group "bluff" game bot.
 
-Features:
-- Lobby with Join / Start (max 10, min 3)
-- Sequential nickname registration with a 1-minute timeout per player
-- Random secret Killer with DM control panel (Curse Others, Self Curse, Remove Curse, Fake Alert)
-- Cursed players' group messages are deleted after 0.5s and replaced with "🤐 [Nickname] စကားပြောလို့မရပါ"
-- Vote phase (/vote) with a 2-minute timeout. Tie => Killer wins (no elimination).
-- Eliminated players are marked inactive and cannot be cursed or vote
-- SQLite persistence for games, players, cursed status, and votes
-"""
+```python name=config.py
+# Configuration file - keep secrets out of source control.
+# Optionally use environment variables (.env) - python-dotenv is in requirements.
 
-import asyncio
-import logging
 import os
-import random
+from dotenv import load_dotenv
+load_dotenv()
+
+API_ID = int(os.getenv("API_ID", "0"))            # e.g. 19703932
+API_HASH = os.getenv("API_HASH", "")              # e.g. "2fe31e84..."
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")            # e.g. "8580...:AAFoo..."
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))        # e.g. 1735522859
+STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "0"))  # e.g. -1002849045181
+
+# General settings
+DEFAULT_SEND_DELAY = float(os.getenv("DEFAULT_SEND_DELAY", "2.0"))  # seconds between copied messages
+WAIT_AD_SECONDS = int(os.getenv("WAIT_AD_SECONDS", "10"))
+VIP_PRICE_LABEL = os.getenv("VIP_PRICE_LABEL", "Contact @osamu1123 to buy VIP")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # Optional: Bot username for deep links
+
+DATABASE_PATH = os.getenv("DATABASE_PATH", "data.db")
+```
+
+```python name=db.py
+# Simple SQLite + SQLAlchemy-lite layer using sqlite3 for simplicity.
+
 import sqlite3
-import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+import json
+from contextlib import closing
+from datetime import datetime
+import threading
+from config import DATABASE_PATH
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-from telegram.constants import ChatMemberStatus
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+_lock = threading.Lock()
 
-import config
+def get_conn():
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-# ---------- Database helpers ----------
 def init_db():
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS games (
+    with _lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        # movies: id (int autoinc), title, caption, poster_chat_id, poster_message_id, message_ids(json), token, created_at
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS movies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            caption TEXT,
+            poster_chat_id INTEGER,
+            poster_message_id INTEGER,
+            message_ids TEXT,
+            token TEXT UNIQUE,
+            created_at TEXT
+        )
+        """)
+        # users: id, is_vip (0/1), banned (0/1)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            is_vip INTEGER DEFAULT 0,
+            banned INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+        """)
+        # channels: chat_id, name, join_link
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS force_channels (
             chat_id INTEGER PRIMARY KEY,
-            state TEXT,
-            owner_id INTEGER,
-            registration_index INTEGER,
-            waiting_user_id INTEGER,
-            join_message_id INTEGER,
-            join_message_text TEXT,
-            killer_id INTEGER,
-            vote_message_id INTEGER,
-            vote_deadline INTEGER
+            name TEXT,
+            invite_link TEXT
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS players (
-            chat_id INTEGER,
-            user_id INTEGER,
-            username TEXT,
-            nickname TEXT,
-            role TEXT,
-            active INTEGER,
-            PRIMARY KEY (chat_id, user_id)
+        """)
+        # ads table (single latest ad)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS waiting_ads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            media_chat_id INTEGER,
+            media_message_id INTEGER,
+            url TEXT,
+            text TEXT,
+            created_at TEXT
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cursed (
-            chat_id INTEGER,
-            user_id INTEGER,
-            PRIMARY KEY (chat_id, user_id)
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS votes (
-            chat_id INTEGER,
-            voter_id INTEGER,
-            target_id INTEGER,
-            PRIMARY KEY (chat_id, voter_id)
-        )
-        """
-    )
-    con.commit()
-    con.close()
+        """)
+        conn.commit()
+        conn.close()
 
+def add_movie(title, caption, message_ids, poster_chat_id=None, poster_message_id=None, token=None):
+    with _lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        cur.execute("""
+        INSERT INTO movies (title, caption, poster_chat_id, poster_message_id, message_ids, token, created_at)
+        VALUES (?,?,?,?,?,?,?)
+        """, (title, caption, poster_chat_id, poster_message_id, json.dumps(message_ids), token, now))
+        mid = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return mid
 
-def db_get_game_row(chat_id: int) -> Optional[Tuple]:
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT * FROM games WHERE chat_id = ?", (chat_id,))
-    row = cur.fetchone()
-    con.close()
-    return row
-
-
-def db_upsert_game_row(
-    chat_id: int,
-    state: str,
-    owner_id: Optional[int],
-    registration_index: int,
-    waiting_user_id: Optional[int],
-    join_message_id: Optional[int],
-    join_message_text: Optional[str],
-    killer_id: Optional[int],
-    vote_message_id: Optional[int],
-    vote_deadline: Optional[int],
-):
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO games(chat_id, state, owner_id, registration_index, waiting_user_id, join_message_id, join_message_text, killer_id, vote_message_id, vote_deadline)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            state=excluded.state,
-            owner_id=excluded.owner_id,
-            registration_index=excluded.registration_index,
-            waiting_user_id=excluded.waiting_user_id,
-            join_message_id=excluded.join_message_id,
-            join_message_text=excluded.join_message_text,
-            killer_id=excluded.killer_id,
-            vote_message_id=excluded.vote_message_id,
-            vote_deadline=excluded.vote_deadline
-        """,
-        (
-            chat_id,
-            state,
-            owner_id,
-            registration_index,
-            waiting_user_id,
-            join_message_id,
-            join_message_text,
-            killer_id,
-            vote_message_id,
-            vote_deadline,
-        ),
-    )
-    con.commit()
-    con.close()
-
-
-def db_delete_game(chat_id: int):
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM games WHERE chat_id = ?", (chat_id,))
-    cur.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
-    cur.execute("DELETE FROM cursed WHERE chat_id = ?", (chat_id,))
-    cur.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
-    con.commit()
-    con.close()
-
-
-def db_upsert_player(chat_id: int, user_id: int, username: str, nickname: Optional[str], role: str, active: bool):
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO players(chat_id, user_id, username, nickname, role, active)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(chat_id, user_id) DO UPDATE SET
-            username=excluded.username,
-            nickname=excluded.nickname,
-            role=excluded.role,
-            active=excluded.active
-        """,
-        (chat_id, user_id, username, nickname, role, int(active)),
-    )
-    con.commit()
-    con.close()
-
-
-def db_get_players(chat_id: int) -> List[Tuple]:
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT user_id, username, nickname, role, active FROM players WHERE chat_id = ? ORDER BY rowid", (chat_id,))
-    rows = cur.fetchall()
-    con.close()
-    return rows
-
-
-def db_delete_player(chat_id: int, user_id: int):
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    cur.execute("DELETE FROM cursed WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    cur.execute("DELETE FROM votes WHERE chat_id = ? AND voter_id = ?", (chat_id, user_id))
-    cur.execute("DELETE FROM votes WHERE chat_id = ? AND target_id = ?", (chat_id, user_id))
-    con.commit()
-    con.close()
-
-
-def db_set_cursed(chat_id: int, user_id: int):
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO cursed(chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
-    con.commit()
-    con.close()
-
-
-def db_remove_cursed(chat_id: int, user_id: int):
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM cursed WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    con.commit()
-    con.close()
-
-
-def db_get_cursed_set(chat_id: int) -> Set[int]:
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT user_id FROM cursed WHERE chat_id = ?", (chat_id,))
-    rows = cur.fetchall()
-    con.close()
-    return {r[0] for r in rows}
-
-
-def db_add_vote(chat_id: int, voter_id: int, target_id: int):
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO votes(chat_id, voter_id, target_id) VALUES (?, ?, ?)",
-        (chat_id, voter_id, target_id),
-    )
-    con.commit()
-    con.close()
-
-
-def db_clear_votes(chat_id: int):
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
-    con.commit()
-    con.close()
-
-
-def db_get_votes(chat_id: int) -> Dict[int, int]:
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT voter_id, target_id FROM votes WHERE chat_id = ?", (chat_id,))
-    rows = cur.fetchall()
-    con.close()
-    return {r[0]: r[1] for r in rows}
-
-
-# ---------- In-memory model ----------
-@dataclass
-class Player:
-    user_id: int
-    username: str
-    nickname: Optional[str] = None
-    role: str = "villager"
-    active: bool = True
-
-
-@dataclass
-class Game:
-    chat_id: int
-    state: str = "idle"  # idle, lobby, registration, in_game, voting, ended
-    owner_id: Optional[int] = None
-    players: List[Player] = field(default_factory=list)
-    join_message_id: Optional[int] = None
-    join_message_text: Optional[str] = None
-    waiting_for_nickname_user_id: Optional[int] = None
-    registration_index: int = 0
-    cursed: Set[int] = field(default_factory=set)
-    killer_id: Optional[int] = None
-    vote_message_id: Optional[int] = None
-    vote_deadline: Optional[int] = None
-
-    # runtime-only tasks (not persisted)
-    registration_task: Optional[asyncio.Task] = None
-    voting_task: Optional[asyncio.Task] = None
-
-
-# All active games in memory
-GAMES: Dict[int, Game] = {}
-
-
-# ---------- Utility functions ----------
-def load_game_from_db(chat_id: int) -> Optional[Game]:
-    row = db_get_game_row(chat_id)
+def get_movie_by_id(movie_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM movies WHERE id = ?", (movie_id,))
+    row = c.fetchone()
+    conn.close()
     if not row:
         return None
-    # row fields: chat_id, state, owner_id, registration_index, waiting_user_id,
-    # join_message_id, join_message_text, killer_id, vote_message_id, vote_deadline
-    _, state, owner_id, reg_idx, waiting_user_id, join_msg_id, join_msg_text, killer_id, vote_msg_id, vote_deadline = row
-    g = Game(chat_id=chat_id)
-    g.state = state
-    g.owner_id = owner_id
-    g.registration_index = reg_idx or 0
-    g.waiting_for_nickname_user_id = waiting_user_id
-    g.join_message_id = join_msg_id
-    g.join_message_text = join_msg_text
-    g.killer_id = killer_id
-    g.vote_message_id = vote_msg_id
-    g.vote_deadline = vote_deadline
-    # load players
-    rows = db_get_players(chat_id)
-    for user_id, username, nickname, role, active in rows:
-        g.players.append(Player(user_id=user_id, username=username, nickname=nickname, role=role, active=bool(active)))
-    # cursed
-    g.cursed = db_get_cursed_set(chat_id)
-    return g
+    return dict(row)
 
+def get_movie_by_token(token):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM movies WHERE token = ?", (token,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return dict(row)
 
-def save_game_to_db(game: Game):
-    vote_deadline = game.vote_deadline
-    db_upsert_game_row(
-        chat_id=game.chat_id,
-        state=game.state,
-        owner_id=game.owner_id,
-        registration_index=game.registration_index,
-        waiting_user_id=game.waiting_for_nickname_user_id,
-        join_message_id=game.join_message_id,
-        join_message_text=game.join_message_text,
-        killer_id=game.killer_id,
-        vote_message_id=game.vote_message_id,
-        vote_deadline=vote_deadline,
-    )
-    # players
-    for p in game.players:
-        db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
-    # cursed set
-    # clear existing then insert current
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM cursed WHERE chat_id = ?", (game.chat_id,))
-    for uid in game.cursed:
-        cur.execute("INSERT OR IGNORE INTO cursed(chat_id, user_id) VALUES (?, ?)", (game.chat_id, uid))
-    con.commit()
-    con.close()
+def set_movie_poster(movie_id, chat_id, message_id):
+    with _lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("UPDATE movies SET poster_chat_id=?, poster_message_id=? WHERE id=?", (chat_id, message_id, movie_id))
+        conn.commit()
+        conn.close()
 
+def set_movie_token(movie_id, token):
+    with _lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("UPDATE movies SET token=? WHERE id=?", (token, movie_id))
+        conn.commit()
+        conn.close()
 
-def remove_player_from_game(game: Game, user_id: int):
-    # mark inactive in memory and DB
-    for p in game.players:
-        if p.user_id == user_id:
-            p.active = False
-            db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
-            break
-    # remove votes referencing them
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM votes WHERE chat_id = ? AND voter_id = ?", (game.chat_id, user_id))
-    cur.execute("DELETE FROM votes WHERE chat_id = ? AND target_id = ?", (game.chat_id, user_id))
-    con.commit()
-    con.close()
+def list_movies():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM movies ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
+def add_user_if_missing(user_id):
+    with _lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE id=?", (user_id,))
+        if not c.fetchone():
+            now = datetime.utcnow().isoformat()
+            c.execute("INSERT INTO users (id, created_at) VALUES (?,?)", (user_id, now))
+            conn.commit()
+        conn.close()
 
-def active_players(game: Game) -> List[Player]:
-    return [p for p in game.players if p.active]
+def set_vip(user_id, is_vip: bool):
+    add_user_if_missing(user_id)
+    with _lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_vip=? WHERE id=?", (1 if is_vip else 0, user_id))
+        conn.commit()
+        conn.close()
 
+def is_vip(user_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT is_vip FROM users WHERE id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row["is_vip"]) if row else False
 
-def player_by_user_id(game: Game, user_id: int) -> Optional[Player]:
-    return next((p for p in game.players if p.user_id == user_id), None)
+def add_force_channel(chat_id, name=None, invite_link=None):
+    with _lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO force_channels (chat_id, name, invite_link) VALUES (?,?,?)", (chat_id, name, invite_link))
+        conn.commit()
+        conn.close()
 
+def list_force_channels():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM force_channels")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
-def active_villagers_count(game: Game) -> int:
-    return sum(1 for p in game.players if p.active and p.role != "killer")
+def delete_force_channel(chat_id):
+    with _lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("DELETE FROM force_channels WHERE chat_id=?", (chat_id,))
+        conn.commit()
+        conn.close()
 
+def set_waiting_ad(media_chat_id, media_message_id, url=None, text=None):
+    with _lock:
+        conn = get_conn()
+        c = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        c.execute("INSERT INTO waiting_ads (media_chat_id, media_message_id, url, text, created_at) VALUES (?,?,?,?,?)",
+                  (media_chat_id, media_message_id, url, text, now))
+        conn.commit()
+        conn.close()
 
-def active_killers_count(game: Game) -> int:
-    return sum(1 for p in game.players if p.active and p.role == "killer")
+def get_latest_waiting_ad():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM waiting_ads ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+```
 
+```python name=models.py
+# Lightweight models / helpers for in-memory use (optional).
+# For this implementation most DB operations are in db.py.
 
-# ---------- Bot command & callback handlers ----------
-async def start_game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command only works in groups.")
-        return
+from typing import List
+import json
 
-    # check admin
-    member = await context.bot.get_chat_member(chat.id, user.id)
-    if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-        await update.message.reply_text("Only group Admin/Owner can start a game.")
-        return
-
-    # Create new game or reset existing
-    game = GAMES.get(chat.id)
-    if not game:
-        game = load_game_from_db(chat.id) or Game(chat_id=chat.id)
-        GAMES[chat.id] = game
-
-    if game.state not in ("idle", "ended"):
-        await update.message.reply_text("A game is already running in this chat.")
-        return
-
-    # initialize
-    game.state = "lobby"
-    game.owner_id = user.id
-    game.players = []
-    game.cursed = set()
-    game.registration_index = 0
-    game.waiting_for_nickname_user_id = None
-    game.killer_id = None
-    game.vote_message_id = None
-    game.vote_deadline = None
-    # persist
-    save_game_to_db(game)
-
-    text = "ဂိမ်းကစားမည့်သူများ - Join 🙋‍♂️\n(အများဆုံး 10 ယောက်၊ အနည်းဆုံး 3 ယောက်လိုအပ်ပါသည်)"
-    join_button = InlineKeyboardButton("Join 🙋‍♂️", callback_data="join")
-    start_button = InlineKeyboardButton("Start Game 🚀", callback_data="start_game")
-    kb = InlineKeyboardMarkup([[join_button, start_button]])
-    sent = await update.message.reply_text(text, reply_markup=kb)
-    game.join_message_id = sent.message_id
-    game.join_message_text = text
-    save_game_to_db(game)
-    await update.message.reply_text("Lobby opened. Players, press Join 🙋‍♂️")
-
-
-async def join_or_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    chat = query.message.chat
-    game = GAMES.get(chat.id) or (load_game_from_db(chat.id) or Game(chat_id=chat.id))
-    GAMES[chat.id] = game
-
-    if game.state != "lobby":
-        await query.answer(text="Lobby is not active.")
-        return
-
-    if query.data == "join":
-        if player_by_user_id(game, user.id):
-            await query.answer(text="You already joined.")
-            return
-        if len(game.players) >= 10:
-            await query.answer(text="Lobby is full.")
-            return
-        username = user.username or (user.first_name or f"user{user.id}")
-        p = Player(user_id=user.id, username=username)
-        game.players.append(p)
-        db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
-        save_game_to_db(game)
-        count = len(game.players)
-        new_text = f"ဂိမ်းကစားမည့်သူများ - {count} joined\n(အများဆုံး 10 ယောက်၊ အနည်းဆုံး 3 ယောက်လိုအပ်ပါသည်)"
-        if count >= 10:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Full (10)", callback_data="noop")]])
-        else:
-            kb = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("Join 🙋‍♂️", callback_data="join"),
-                        InlineKeyboardButton("Start Game 🚀", callback_data="start_game"),
-                    ]
-                ]
-            )
+def parse_message_ids_field(field_value):
+    if not field_value:
+        return []
+    if isinstance(field_value, str):
         try:
-            await query.edit_message_text(new_text, reply_markup=kb)
-            game.join_message_text = new_text
-            game.join_message_id = query.message.message_id
-            save_game_to_db(game)
+            return json.loads(field_value)
         except Exception:
-            pass
-        await query.answer(text=f"Joined as @{p.username}")
+            # fallback comma separated
+            return [int(x.strip()) for x in field_value.split(",") if x.strip()]
+    if isinstance(field_value, (list, tuple)):
+        return list(field_value)
+    return []
+```
 
-    elif query.data == "start_game":
-        # verify admin
-        member = await context.bot.get_chat_member(chat.id, user.id)
-        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-            await query.answer(text="Only Admin/Owner can start the game.")
-            return
-        if len(game.players) < 3:
-            await query.answer(text="At least 3 players are required to start.")
-            return
-        # move to registration
-        game.state = "registration"
-        save_game_to_db(game)
-        await query.edit_message_text("Registration started. Bot will ask for nicknames one-by-one.")
-        # begin sequential nickname registration
-        await ask_next_nickname(context, game)
+```python name=utils.py
+# Utility helpers: parse message id ranges, generate tokens, admin check, format.
 
+import re
+import secrets
+import json
+from typing import List
 
-async def ask_next_nickname(context: ContextTypes.DEFAULT_TYPE, game: Game):
-    # If registration finished
-    while game.registration_index < len(game.players) and not game.players[game.registration_index].active:
-        game.registration_index += 1
-
-    if game.registration_index >= len(game.players):
-        await finish_registration(context, game)
-        return
-
-    player = game.players[game.registration_index]
-    chat_id = game.chat_id
-    mention = f"@{player.username}"
-    sent = await context.bot.send_message(chat_id=chat_id, text=f"{mention} ကျေးဇူးပြု၍ Nickname ပို့ပါ။")
-    game.waiting_for_nickname_user_id = player.user_id
-    save_game_to_db(game)
-
-    # schedule timeout for this player's nickname
-    if game.registration_task and not game.registration_task.done():
-        game.registration_task.cancel()
-    game.registration_task = asyncio.create_task(registration_timeout(context, game.chat_id, player.user_id))
-
-
-async def registration_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    await asyncio.sleep(config.NICKNAME_TIMEOUT)
-    game = GAMES.get(chat_id)
-    if not game:
-        return
-    if game.state != "registration":
-        return
-    if game.waiting_for_nickname_user_id != user_id:
-        return
-    # timeout: remove the user from game (mark inactive) and continue
-    player = player_by_user_id(game, user_id)
-    if player:
-        player.active = False
-        db_upsert_player(chat_id, player.user_id, player.username, player.nickname, player.role, player.active)
-    # notify group
-    await context.bot.send_message(chat_id, f"@{player.username} က nickname မပေးသေးလို့ အလိုမရှိသွားပါပြီ။")
-    # advance
-    game.registration_index += 1
-    game.waiting_for_nickname_user_id = None
-    save_game_to_db(game)
-    # If too few players remain, abort
-    if len(active_players(game)) < 3:
-        await context.bot.send_message(chat_id, "Players fewer than 3 after timeouts. Lobby closed.")
-        game.state = "ended"
-        save_game_to_db(game)
-        return
-    # ask next
-    await ask_next_nickname(context, game)
-
-
-async def finish_registration(context: ContextTypes.DEFAULT_TYPE, game: Game):
-    # ensure all players have nickname; default to username if missing
-    for p in game.players:
-        if not p.nickname:
-            p.nickname = p.username
-            db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
-
-    # assign killer
-    alive_players = [p for p in game.players if p.active]
-    killer_player = random.choice(alive_players)
-    killer_player.role = "killer"
-    game.killer_id = killer_player.user_id
-    # persist roles
-    for p in game.players:
-        db_upsert_player(game.chat_id, p.user_id, p.username, p.nickname, p.role, p.active)
-    game.state = "in_game"
-    game.waiting_for_nickname_user_id = None
-    game.registration_index = len(game.players)
-    save_game_to_db(game)
-    await context.bot.send_message(game.chat_id, "ဂိမ်းစပါပြီ")
-    # send killer panel DM
-    try:
-        await send_killer_panel(context, killer_player.user_id, game)
-    except Exception as e:
-        logger.exception("Failed to send killer panel DM: %s", e)
-        await context.bot.send_message(game.chat_id, "Failed to send killer control panel to killer. Ensure killer has opened DM with the bot.")
-
-
-async def send_killer_panel(context: ContextTypes.DEFAULT_TYPE, killer_user_id: int, game: Game):
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Curse Others", callback_data=f"panel_curse_others:{game.chat_id}")],
-            [InlineKeyboardButton("Self Curse", callback_data=f"panel_self_curse:{game.chat_id}")],
-            [InlineKeyboardButton("Remove Curse", callback_data=f"panel_remove_curse:{game.chat_id}")],
-            [InlineKeyboardButton("Fake Alert", callback_data=f"panel_fake_alert:{game.chat_id}")],
-        ]
-    )
-    await context.bot.send_message(
-        chat_id=killer_user_id,
-        text=(
-            "You are the Killer. Use the buttons below to act covertly.\n\n"
-            "- Curse Others: pick a player to curse (their messages will be deleted and replaced in group)\n"
-            "- Self Curse: curse yourself to bluff\n"
-            "- Remove Curse: uncurse a currently cursed player\n"
-            "- Fake Alert: send a 'Curse မိပြီ' message to the group without cursing anyone\n\n(Buttons will open additional choices when needed.)"
-        ),
-        reply_markup=kb,
-    )
-
-
-async def callback_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user = query.from_user
-
-    # Panel: choose others to curse
-    if data.startswith("panel_curse_others:"):
-        chat_id = int(data.split(":", 1)[1])
-        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
-        if not game or game.killer_id != user.id:
-            await query.answer(text="Only killer can use this.", show_alert=True)
-            return
-        buttons = []
-        for p in game.players:
-            if p.user_id == user.id or not p.active:
-                continue
-            buttons.append([InlineKeyboardButton(p.nickname or p.username, callback_data=f"curse:{chat_id}:{p.user_id}")])
-        if not buttons:
-            buttons = [[InlineKeyboardButton("No valid targets", callback_data="noop")]]
-        kb = InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Cancel", callback_data="panel_cancel")]])
-        await query.edit_message_text("Select player to curse:", reply_markup=kb)
-
-    elif data.startswith("curse:"):
-        _, chat_id_str, target_id_str = data.split(":")
-        chat_id = int(chat_id_str)
-        target_id = int(target_id_str)
-        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
-        if not game or game.killer_id != user.id:
-            await query.answer(text="Only killer can do that.", show_alert=True)
-            return
-        target = player_by_user_id(game, target_id)
-        if target and target.active:
-            game.cursed.add(target_id)
-            db_set_cursed(chat_id, target_id)
-            save_game_to_db(game)
-            await context.bot.send_message(chat_id=chat_id, text="⚠️ Killer က တစ်ယောက်ကို နှောက်ယှက်လိုက်ပါပြီ!")
-            await query.edit_message_text("Cursed.")
-            logger.info("Killer %s cursed %s in chat %s", user.id, target_id, chat_id)
-        else:
-            await query.answer(text="Invalid target", show_alert=True)
-
-    elif data.startswith("panel_self_curse:"):
-        chat_id = int(data.split(":", 1)[1])
-        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
-        if not game or game.killer_id != user.id:
-            await query.answer(text="Only killer can use this.", show_alert=True)
-            return
-        game.cursed.add(user.id)
-        db_set_cursed(chat_id, user.id)
-        save_game_to_db(game)
-        await context.bot.send_message(chat_id=chat_id, text="⚠️ Killer က တစ်ယောက်ကို နှောက်ယှက်လိုက်ပါပြ���!")
-        await query.edit_message_text("You cursed yourself (Self Curse).")
-        logger.info("Killer %s self-cursed in chat %s", user.id, chat_id)
-
-    elif data.startswith("panel_remove_curse:"):
-        chat_id = int(data.split(":", 1)[1])
-        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
-        if not game or game.killer_id != user.id:
-            await query.answer(text="Only killer can use this.", show_alert=True)
-            return
-        if not game.cursed:
-            await query.edit_message_text("There are no cursed players currently.")
-            return
-        buttons = []
-        for uid in list(game.cursed):
-            p = player_by_user_id(game, uid)
-            if not p:
-                continue
-            buttons.append([InlineKeyboardButton(p.nickname or p.username, callback_data=f"remove_curse:{chat_id}:{uid}")])
-        buttons.append([InlineKeyboardButton("Cancel", callback_data="panel_cancel")])
-        kb = InlineKeyboardMarkup(buttons)
-        await query.edit_message_text("Select cursed player to remove curse:", reply_markup=kb)
-
-    elif data.startswith("remove_curse:"):
-        _, chat_id_str, target_id_str = data.split(":")
-        chat_id = int(chat_id_str)
-        target_id = int(target_id_str)
-        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
-        if not game or game.killer_id != user.id:
-            await query.answer(text="Only killer can use this.", show_alert=True)
-            return
-        if target_id in game.cursed:
-            game.cursed.remove(target_id)
-            db_remove_cursed(chat_id, target_id)
-            save_game_to_db(game)
-            await query.edit_message_text("Removed curse.")
-            logger.info("Killer %s removed curse from %s in chat %s", user.id, target_id, chat_id)
-        else:
-            await query.answer(text="That player is not cursed.", show_alert=True)
-
-    elif data.startswith("panel_fake_alert:"):
-        chat_id = int(data.split(":", 1)[1])
-        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
-        if not game or game.killer_id != user.id:
-            await query.answer(text="Only killer can use this.", show_alert=True)
-            return
-        await context.bot.send_message(chat_id=chat_id, text="Curse မိပြီ")
-        await query.edit_message_text("Fake alert sent to group.")
-        logger.info("Killer %s sent fake alert in chat %s", user.id, chat_id)
-
-    elif data == "panel_cancel" or data == "noop":
-        try:
-            await query.delete_message()
-        except Exception:
-            await query.answer()
-
-    elif data.startswith("vote:"):
-        _, chat_id_str, target_id_str = data.split(":")
-        chat_id = int(chat_id_str)
-        target_id = int(target_id_str)
-        game = GAMES.get(chat_id) or load_game_from_db(chat_id)
-        voter_id = user.id
-        vp = player_by_user_id(game, voter_id)
-        if not vp or not vp.active:
-            await query.answer(text="You are not an active player and cannot vote.", show_alert=True)
-            return
-        # check if already voted
-        votes = db_get_votes(chat_id)
-        if voter_id in votes:
-            await query.answer(text="You already voted.", show_alert=True)
-            return
-        db_add_vote(chat_id, voter_id, target_id)
-        await query.answer(text=f"Your vote recorded.")
-        logger.info("User %s voted for %s in chat %s", voter_id, target_id, chat_id)
-        # If all active players have voted, tally now
-        votes = db_get_votes(chat_id)
-        if len(votes) >= len(active_players(game)):
-            # cancel voting timeout
-            if game.voting_task and not game.voting_task.done():
-                game.voting_task.cancel()
-            await tally_votes(context, game)
-
-
-async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
-        return
-    chat = message.chat
-    user = message.from_user
-    if chat.type not in ("group", "supergroup"):
-        return
-    game = GAMES.get(chat.id) or load_game_from_db(chat.id)
-    if not game:
-        return
-    GAMES[chat.id] = game
-
-    # registration flow: accept nickname from expected user
-    if game.state == "registration" and game.waiting_for_nickname_user_id:
-        if user.id == game.waiting_for_nickname_user_id:
-            text = (message.text or "").strip()
-            if not text:
-                await message.reply_text("Nickname cannot be empty. Please send a text nickname.")
-                return
-            player = player_by_user_id(game, user.id)
-            if player:
-                player.nickname = text
-                db_upsert_player(game.chat_id, player.user_id, player.username, player.nickname, player.role, player.active)
-                # cancel registration timeout
-                if game.registration_task and not game.registration_task.done():
-                    game.registration_task.cancel()
-                    game.registration_task = None
-                game.registration_index += 1
-                game.waiting_for_nickname_user_id = None
-                save_game_to_db(game)
-                await message.reply_text(f"Saved nickname: {text}")
-                await ask_next_nickname(context, game)
-                return
-        else:
-            # ignore messages from others during registration
-            return
-
-    # in-game: handle cursed deletion
-    if game.state in ("in_game", "voting"):
-        p = player_by_user_id(game, user.id)
-        if p and p.active and user.id in game.cursed:
-            nickname = p.nickname or p.username
-            # schedule delete and replacement
-            asyncio.create_task(handle_cursed_message(context, chat.id, message.message_id, nickname))
-            return
-
-
-async def handle_cursed_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, nickname: str):
-    await asyncio.sleep(config.CURSE_DELETE_DELAY)
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        logger.debug("Failed to delete cursed message: %s", e)
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=f"🤐 {nickname} စကားပြောလို့မရပါ")
-    except Exception as e:
-        logger.debug("Failed to send replacement message: %s", e)
-
-
-# Vote command: initiate voting phase
-async def vote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use /vote in the group chat where the game is running.")
-        return
-    game = GAMES.get(chat.id) or load_game_from_db(chat.id)
-    if not game:
-        await update.message.reply_text("No active game in this chat.")
-        return
-    if game.state != "in_game":
-        await update.message.reply_text("Voting can only start during the game.")
-        return
-    # create buttons for active players
-    buttons = []
-    for p in game.players:
-        if p.active:
-            buttons.append([InlineKeyboardButton(p.nickname or p.username, callback_data=f"vote:{chat.id}:{p.user_id}")])
-    if not buttons:
-        await update.message.reply_text("No active players to vote for.")
-        return
-    kb = InlineKeyboardMarkup(buttons)
-    sent = await update.message.reply_text("Vote for who you suspect is the Killer:", reply_markup=kb)
-    game.vote_message_id = sent.message_id
-    game.state = "voting"
-    game.vote_deadline = int(time.time()) + config.VOTE_TIMEOUT
-    save_game_to_db(game)
-    # schedule vote timeout
-    if game.voting_task and not game.voting_task.done():
-        game.voting_task.cancel()
-    game.voting_task = asyncio.create_task(vote_timeout_task(context, game.chat_id))
-    await update.message.reply_text(f"Voting started. You have {config.VOTE_TIMEOUT} seconds.")
-
-
-async def vote_timeout_task(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    await asyncio.sleep(config.VOTE_TIMEOUT)
-    game = GAMES.get(chat_id) or load_game_from_db(chat_id)
-    if not game:
-        return
-    if game.state != "voting":
-        return
-    await context.bot.send_message(chat_id, "Voting time ended. Tallying votes...")
-    await tally_votes(context, game)
-
-
-async def tally_votes(context: ContextTypes.DEFAULT_TYPE, game: Game):
-    chat_id = game.chat_id
-    votes = db_get_votes(chat_id)
-    if not votes:
-        await context.bot.send_message(chat_id, "No votes were cast. No one is executed.")
-        # return to in_game
-        game.state = "in_game"
-        db_clear_votes(chat_id)
-        save_game_to_db(game)
-        return
-    # tally counts
-    tally: Dict[int, int] = {}
-    for voter, target in votes.items():
-        tally[target] = tally.get(target, 0) + 1
-    # determine top
-    top_count = max(tally.values())
-    top_candidates = [uid for uid, cnt in tally.items() if cnt == top_count]
-    # Tie rule: If tie, no one eliminated and Killer wins (game ends with killer victory)
-    if len(top_candidates) > 1:
-        # reveal killer
-        killer_player = player_by_user_id(game, game.killer_id) if game.killer_id else None
-        killer_nick = killer_player.nickname if killer_player else "Killer"
-        await context.bot.send_message(chat_id, f"မဲတူနေမှုဖြစ်နေပါသည်။ Killer အနိုင်ရပါသည်။ Killer: {killer_nick}. ဂိမ်းပြီးပါပြီ။")
-        game.state = "ended"
-        db_clear_votes(chat_id)
-        save_game_to_db(game)
-        return
-
-    top_user_id = top_candidates[0]
-    target_player = player_by_user_id(game, top_user_id)
-    if not target_player:
-        await context.bot.send_message(chat_id, "Error resolving voted player.")
-        game.state = "in_game"
-        db_clear_votes(chat_id)
-        save_game_to_db(game)
-        return
-
-    # If top is killer -> villagers win
-    if target_player.role == "killer":
-        await context.bot.send_message(chat_id, f"မိသွားပါပြီ! {target_player.nickname} သည် Killer ဖြစ်သည်။ ဂိမ်းပြီးပါပြီ။")
-        game.state = "ended"
-        db_clear_votes(chat_id)
-        save_game_to_db(game)
-        return
-    else:
-        # wrong catch: eliminate the player
-        target_player.active = False
-        db_upsert_player(chat_id, target_player.user_id, target_player.username, target_player.nickname, target_player.role, target_player.active)
-        db_remove_cursed(chat_id, target_player.user_id)
-        await context.bot.send_message(chat_id, f"မှားယွင်းဖမ်းဆီးမိသည်။ {target_player.nickname} သည် ဂိမ်းမှ ထွက်ရမည်။")
-        db_clear_votes(chat_id)
-        save_game_to_db(game)
-        # Check win condition: if villagers count equals killers -> killer wins
-        villagers = active_villagers_count(game)
-        killers = active_killers_count(game)
-        if killers >= villagers:
-            killer_player = player_by_user_id(game, game.killer_id) if game.killer_id else None
-            killer_nick = killer_player.nickname if killer_player else "Killer"
-            await context.bot.send_message(chat_id, f"Killer အနိုင်ရပါပြီ။ Killer: {killer_nick}. ဂိမ်းပြီးပါပြီ။")
-            game.state = "ended"
-            save_game_to_db(game)
-            return
-        # otherwise continue game
-        game.state = "in_game"
-        save_game_to_db(game)
-        return
-
-
-# ---------- Startup / helpers ----------
-async def on_startup(application: Application):
-    logger.info("Bot starting up.")
-    init_db()
-    # Load incomplete games into memory
-    con = sqlite3.connect(config.DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT chat_id FROM games WHERE state IN ('lobby','registration','in_game','voting')")
-    rows = cur.fetchall()
-    con.close()
-    for (chat_id,) in rows:
-        g = load_game_from_db(chat_id)
-        if g:
-            GAMES[chat_id] = g
-            logger.info("Loaded game from DB for chat %s state=%s", chat_id, g.state)
-            # If a game was in voting state and the vote_deadline has passed, tally immediately
-            if g.state == "voting":
-                if g.vote_deadline and int(time.time()) >= g.vote_deadline:
-                    # schedule immediate tally
-                    asyncio.create_task(tally_votes(application.bot, g))
+def parse_ids_text(text: str) -> List[int]:
+    # Supports comma separated and ranges like 100-105 and combos
+    parts = re.split(r"[,\s]+", text.strip())
+    ids = []
+    for p in parts:
+        if not p:
+            continue
+        if "-" in p:
+            try:
+                a,b = p.split("-",1)
+                a,b = int(a), int(b)
+                if a <= b:
+                    ids.extend(list(range(a, b+1)))
                 else:
-                    # schedule remaining vote timeout
-                    remaining = (g.vote_deadline or 0) - int(time.time())
-                    if remaining > 0:
-                        g.voting_task = asyncio.create_task(vote_timeout_task(application, chat_id))
-            # If registration waiting, schedule remaining registration timeout
-            if g.state == "registration" and g.waiting_for_nickname_user_id:
-                # schedule fresh timeout (we don't have per-player time left persisted), using full timeout
-                g.registration_task = asyncio.create_task(registration_timeout(application, chat_id, g.waiting_for_nickname_user_id))
+                    ids.extend(list(range(b, a+1)))
+            except:
+                pass
+        else:
+            try:
+                ids.append(int(p))
+            except:
+                pass
+    # remove duplicates and keep order
+    seen = set()
+    out = []
+    for x in ids:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
+def gen_token(nbytes=6):
+    return secrets.token_urlsafe(nbytes)
 
-def main():
-    token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        logger.error("Please set TELEGRAM_TOKEN environment variable.")
-        return
-    application = Application.builder().token(token).build()
+def stringify_ids(ids):
+    return json.dumps(ids)
+```
 
-    # Handlers
-    application.add_handler(CommandHandler("start_game", start_game_cmd))
-    application.add_handler(CommandHandler("vote", vote_command))
-    application.add_handler(CallbackQueryHandler(join_or_start_callback, pattern="^(join|start_game)$"))
-    application.add_handler(CallbackQueryHandler(callback_dispatcher, pattern="^"))
-    application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ALL, group_message_handler))
+```python name=handlers_admin.py
+# Admin handlers: add_movie, set_poster, genlink, vip control, channel management, broadcast.
+# This module is imported by bot.py.
 
-    application.post_init = on_startup
+from pyrogram import filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from config import OWNER_ID, STORAGE_CHAT_ID, BOT_USERNAME
+from db import add_movie, set_movie_poster, set_movie_token, add_user_if_missing, set_vip, add_force_channel, list_force_channels, delete_force_channel, list_movies, get_movie_by_id
+from utils import parse_ids_text, gen_token
+import json
+import asyncio
 
-    logger.info("Running bot (polling)...")
-    application.run_polling()
+def register_admin_handlers(app):
+    @app.on_message(filters.command("dashboard") & filters.private & filters.user(OWNER_ID))
+    async def dashboard(_, m: Message):
+        text = "Admin Dashboard"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Add Movie (usage)", callback_data="admin:help_add")],
+            [InlineKeyboardButton("List Movies", callback_data="admin:list_movies")],
+            [InlineKeyboardButton("Add VIP", callback_data="admin:add_vip"), InlineKeyboardButton("Remove VIP", callback_data="admin:remove_vip")],
+            [InlineKeyboardButton("Manage Channels", callback_data="admin:list_channels")],
+            [InlineKeyboardButton("Set Waiting Ad", callback_data="admin:waiting_ad")]
+        ])
+        await m.reply(text, reply_markup=kb)
 
+    @app.on_message(filters.command("add_movie") & filters.private & filters.user(OWNER_ID))
+    async def cmd_add_movie(_, m: Message):
+        # Usage example:
+        # /add_movie Movie Title|Caption text|100-120
+        if len(m.text.split(" ",1)) < 2:
+            await m.reply("Usage:\n/add_movie <title>|<caption>|<message_ids>\nmessage_ids e.g. 100-120 or 101,103,105 or combo")
+            return
+        try:
+            payload = m.text.split(" ",1)[1]
+            title, caption, ids_text = [p.strip() for p in payload.split("|",2)]
+        except:
+            await m.reply("Invalid format. Use:\n/add_movie <title>|<caption>|<message_ids>")
+            return
+        message_ids = parse_ids_text(ids_text)
+        if not message_ids:
+            await m.reply("No valid message IDs parsed.")
+            return
+        # we store message IDs only; poster can be set with set_poster
+        mid = add_movie(title=title, caption=caption, message_ids=message_ids)
+        await m.reply(f"Movie added with id: {mid}\nUse /set_poster {mid}|<poster_message_id_from_storage_group>\nUse /genlink {mid} to create deep link token")
+
+    @app.on_message(filters.command("set_poster") & filters.private & filters.user(OWNER_ID))
+    async def cmd_set_poster(_, m: Message):
+        # /set_poster <movie_id>|<poster_message_id>
+        if len(m.text.split(" ",1)) < 2:
+            await m.reply("Usage:\n/set_poster <movie_id>|<poster_message_id>")
+            return
+        try:
+            payload = m.text.split(" ",1)[1]
+            movie_id_s, poster_msg_s = [p.strip() for p in payload.split("|",1)]
+            movie_id = int(movie_id_s)
+            poster_msg = int(poster_msg_s)
+        except:
+            await m.reply("Invalid input.")
+            return
+        movie = get_movie_by_id(movie_id)
+        if not movie:
+            await m.reply("Movie not found.")
+            return
+        # verify poster exists in storage chat
+        try:
+            await app.get_messages(STORAGE_CHAT_ID, [poster_msg])
+        except Exception as e:
+            await m.reply(f"Couldn't find that message in storage group: {e}")
+            return
+        set_movie_poster(movie_id, STORAGE_CHAT_ID, poster_msg)
+        await m.reply("Poster set successfully.")
+
+    @app.on_message(filters.command("genlink") & filters.private & filters.user(OWNER_ID))
+    async def cmd_genlink(_, m: Message):
+        # /genlink <movie_id>
+        if len(m.text.split(" ",1)) < 2:
+            await m.reply("Usage:\n/genlink <movie_id>")
+            return
+        try:
+            movie_id = int(m.text.split(" ",1)[1].strip())
+        except:
+            await m.reply("Invalid movie id")
+            return
+        movie = get_movie_by_id(movie_id)
+        if not movie:
+            await m.reply("Movie not found.")
+            return
+        token = gen_token()
+        set_movie_token(movie_id, token)
+        # Build deep link
+        if BOT_USERNAME:
+            link = f"https://t.me/{BOT_USERNAME}?start={token}"
+        else:
+            link = f"Use: /start {token}"
+        await m.reply(f"Token generated for movie {movie_id}:\n{token}\nDeep link: {link}")
+
+    @app.on_message(filters.command("add_vip") & filters.private & filters.user(OWNER_ID))
+    async def cmd_add_vip(_, m: Message):
+        if len(m.text.split(" ",1)) < 2:
+            await m.reply("Usage: /add_vip <user_id>")
+            return
+        try:
+            uid = int(m.text.split(" ",1)[1].strip())
+        except:
+            await m.reply("Invalid user id")
+            return
+        set_vip(uid, True)
+        await m.reply(f"User {uid} set as VIP.")
+
+    @app.on_message(filters.command("remove_vip") & filters.private & filters.user(OWNER_ID))
+    async def cmd_remove_vip(_, m: Message):
+        if len(m.text.split(" ",1)) < 2:
+            await m.reply("Usage: /remove_vip <user_id>")
+            return
+        try:
+            uid = int(m.text.split(" ",1)[1].strip())
+        except:
+            await m.reply("Invalid user id")
+            return
+        set_vip(uid, False)
+        await m.reply(f"User {uid} VIP removed.")
+
+    @app.on_message(filters.command("add_channel") & filters.private & filters.user(OWNER_ID))
+    async def cmd_add_channel(_, m: Message):
+        # /add_channel <chat_id>|<name>|<invite_link>
+        if len(m.text.split(" ",1)) < 2:
+            await m.reply("Usage: /add_channel <chat_id>|<name>|<invite_link>")
+            return
+        try:
+            payload = m.text.split(" ",1)[1]
+            chat_id_s, name, invite = [p.strip() for p in payload.split("|",2)]
+            chat_id = int(chat_id_s)
+        except:
+            await m.reply("Invalid params.")
+            return
+        add_force_channel(chat_id, name, invite)
+        await m.reply("Channel added.")
+
+    @app.on_message(filters.command("list_channels") & filters.private & filters.user(OWNER_ID))
+    async def cmd_list_channels(_, m: Message):
+        rows = list_force_channels()
+        if not rows:
+            await m.reply("No force-join channels configured.")
+            return
+        text = "Force Join Channels:\n"
+        for r in rows:
+            text += f"- {r['name'] or r['chat_id']} | {r.get('invite_link')}\n"
+        await m.reply(text)
+
+    @app.on_message(filters.command("broadcast") & filters.private & filters.user(OWNER_ID))
+    async def cmd_broadcast(_, m: Message):
+        if len(m.text.split(" ",1)) < 2:
+            await m.reply("Usage: /broadcast <text>")
+            return
+        text = m.text.split(" ",1)[1]
+        # naive broadcast: iterate all users
+        from db import get_conn
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users")
+        rows = cur.fetchall()
+        conn.close()
+        count = 0
+        for r in rows:
+            try:
+                await app.send_message(r["id"], text)
+                count += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+        await m.reply(f"Broadcast sent to {count} users.")
+```
+
+```python name=handlers_user.py
+# User-facing handlers: /start deep link, force-join check, try again, delivery pipeline.
+
+from pyrogram import filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from config import STORAGE_CHAT_ID, OWNER_ID, DEFAULT_SEND_DELAY, WAIT_AD_SECONDS, VIP_PRICE_LABEL
+from db import get_movie_by_token, get_movie_by_id, add_user_if_missing, is_vip, list_force_channels, get_latest_waiting_ad
+from utils import parse_ids_text
+import asyncio
+
+def register_user_handlers(app):
+    @app.on_message(filters.command("start") & filters.private)
+    async def start_handler(client, m):
+        # /start or /start token
+        args = m.text.split(maxsplit=1)
+        token = None
+        if len(args) > 1:
+            token = args[1].strip()
+        if not token:
+            await m.reply("Welcome! Send me a valid movie link to start.")
+            return
+        movie = get_movie_by_token(token)
+        if not movie:
+            await m.reply("Invalid or expired link.")
+            return
+        uid = m.from_user.id
+        add_user_if_missing(uid)
+        # force join check
+        chan_rows = list_force_channels()
+        not_joined = []
+        for ch in chan_rows:
+            try:
+                mem = await client.get_chat_member(ch["chat_id"], uid)
+                if mem.status not in ("member","administrator","creator"):
+                    not_joined.append(ch)
+            except Exception:
+                not_joined.append(ch)
+        if not_joined:
+            # show join prompt
+            buttons = []
+            for ch in not_joined:
+                link = ch.get("invite_link") or f"https://t.me/{ch['chat_id']}"
+                buttons.append([InlineKeyboardButton(f"Join {ch.get('name') or ch['chat_id']}", url=link)])
+            buttons.append([InlineKeyboardButton("Try Again", callback_data=f"tryagain:{movie['id']}")])
+            await m.reply("Channel Join required. Please join the channels below and press Try Again.", reply_markup=InlineKeyboardMarkup(buttons))
+            return
+        # user joined all
+        await deliver_movie(client, m.chat.id, movie)
+
+    @app.on_callback_query()
+    async def callbacks(client, cq: CallbackQuery):
+        data = cq.data or ""
+        if data.startswith("tryagain:"):
+            movie_id = int(data.split(":",1)[1])
+            movie = get_movie_by_id(movie_id)
+            if not movie:
+                await cq.answer("Movie not found.", show_alert=True)
+                return
+            uid = cq.from_user.id
+            # re-check force join
+            chan_rows = list_force_channels()
+            not_joined = []
+            for ch in chan_rows:
+                try:
+                    mem = await client.get_chat_member(ch["chat_id"], uid)
+                    if mem.status not in ("member","administrator","creator"):
+                        not_joined.append(ch)
+                except Exception:
+                    not_joined.append(ch)
+            if not_joined:
+                await cq.answer("You still haven't joined required channels.", show_alert=True)
+                return
+            await cq.message.delete()
+            await deliver_movie(client, cq.from_user.id, movie)
+
+    async def deliver_movie(client, chat_id, movie_row):
+        # Main entry point for delivery flow
+        movie = movie_row
+        uid = chat_id
+        # If banned - simple check could be added
+        # Check VIP
+        vip = is_vip(uid)
+        # Send poster + inline menu (as per spec: not showing poster to VIP? The spec says: VIP -> direct delivery. Non-VIP show ad and poster?
+        # We'll show poster and caption with buttons for both; videos are delivered after ad / immediately for VIP.
+        if movie.get("poster_chat_id") and movie.get("poster_message_id"):
+            try:
+                await client.copy_message(chat_id, movie["poster_chat_id"], movie["poster_message_id"], caption=movie.get("caption") or "")
+            except Exception:
+                # fallback to send text
+                await client.send_message(chat_id, movie.get("caption") or movie.get("title") or "Here's your movie.")
+        else:
+            await client.send_message(chat_id, movie.get("caption") or movie.get("title") or "Here's your movie.")
+
+        # build inline menu below caption
+        menu = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ SERIES CHANNEL", url="https://t.me/your_series_channel_here")],
+            [InlineKeyboardButton("🍿 MOVIE CHANNEL", url="https://t.me/your_movie_channel_here")],
+            [InlineKeyboardButton("🔗 အကူအညီ", url="https://t.me/your_help_link")],
+            [InlineKeyboardButton("ℹ️ ABOUT", callback_data="about_bot")],
+            [InlineKeyboardButton("👨‍💻 Owner", url=f"https://t.me/{OWNER_ID}")],
+        ])
+        await client.send_message(chat_id, "Choose:", reply_markup=menu)
+
+        # Delivery logic
+        msg_ids = []
+        try:
+            import json
+            msg_ids = json.loads(movie.get("message_ids") or "[]")
+        except:
+            msg_ids = []
+        if not msg_ids:
+            await client.send_message(chat_id, "No video segments found for this movie.")
+            return
+
+        if vip:
+            await client.send_message(chat_id, "VIP detected — starting delivery...")
+            # immediate delivery, short interval
+            for mid in msg_ids:
+                try:
+                    await client.copy_message(chat_id, STORAGE_CHAT_ID, int(mid))
+                    await asyncio.sleep(DEFAULT_SEND_DELAY)
+                except Exception as e:
+                    # skip problematic message
+                    pass
+            await client.send_message(chat_id, "Delivery finished.")
+            return
+
+        # Non-VIP: show waiting ad first
+        ad = get_latest_waiting_ad()
+        if ad:
+            # try to show ad media if present
+            try:
+                if ad.get("media_message_id") and ad.get("media_chat_id"):
+                    await client.copy_message(chat_id, ad["media_chat_id"], ad["media_message_id"], caption=ad.get("text", "Advertisement"))
+                else:
+                    await client.send_message(chat_id, ad.get("text", "Advertisement"))
+            except Exception:
+                try:
+                    if ad.get("text"):
+                        await client.send_message(chat_id, ad.get("text"))
+                except:
+                    pass
+        else:
+            # generic waiting message
+            await client.send_message(chat_id, f"Please wait... advertisement (you can buy VIP to bypass). {VIP_PRICE_LABEL}")
+
+        # Show Buy VIP button under ad
+        buy_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Buy VIP", url=f"https://t.me/osamu1123")],
+            [InlineKeyboardButton("Try Again", callback_data=f"deliver_now:{movie['id']}")]
+        ])
+        sent = await client.send_message(chat_id, f"Waiting for {WAIT_AD_SECONDS} seconds before delivery. Or buy VIP to skip.", reply_markup=buy_kb)
+        # Sleep WAIT_AD_SECONDS then deliver
+        await asyncio.sleep(WAIT_AD_SECONDS)
+        # Check again VIP status in case user bought
+        if is_vip(chat_id):
+            await client.send_message(chat_id, "VIP detected now — starting delivery...")
+            for mid in msg_ids:
+                try:
+                    await client.copy_message(chat_id, STORAGE_CHAT_ID, int(mid))
+                    await asyncio.sleep(DEFAULT_SEND_DELAY)
+                except:
+                    pass
+            await client.send_message(chat_id, "Delivery finished.")
+            return
+        # final delivery for non-VIP
+        for mid in msg_ids:
+            try:
+                await client.copy_message(chat_id, STORAGE_CHAT_ID, int(mid))
+                await asyncio.sleep(DEFAULT_SEND_DELAY)
+            except:
+                pass
+        await client.send_message(chat_id, "Delivery finished.")
+
+    # extra callback to immediately deliver if user clicks deliver_now
+    @app.on_callback_query(filters.regex(r"^deliver_now:"))
+    async def deliver_now_cb(client, cq: CallbackQuery):
+        movie_id = int(cq.data.split(":",1)[1])
+        movie = get_movie_by_id(movie_id)
+        if not movie:
+            await cq.answer("Movie not found.", show_alert=True)
+            return
+        await cq.answer("Starting delivery...", show_alert=False)
+        await cq.message.delete()
+        await deliver_movie(client, cq.from_user.id, movie)
+```
+
+```python name=bot.py
+# Main entrypoint - wire everything together.
+
+import asyncio
+from pyrogram import Client
+from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+from db import init_db
+from handlers_admin import register_admin_handlers
+from handlers_user import register_user_handlers
+
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    raise SystemExit("Please set API_ID, API_HASH and BOT_TOKEN in environment or config.py")
+
+# Initialize DB
+init_db()
+
+app = Client("movie_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Register handlers
+register_admin_handlers(app)
+register_user_handlers(app)
 
 if __name__ == "__main__":
-    main()
+    print("Bot started. Press Ctrl+C to stop.")
+    app.run()
+```
+
+How this implementation maps to your spec
+- Storage Group: the bot copies poster and video segments using STORAGE_CHAT_ID message IDs stored in the DB. This means the bot doesn't store video files locally.
+- Admin flows: /add_movie, /set_poster, /genlink, /add_vip, /remove_vip, /add_channel, /list_channels implemented for owner only.
+- Deep link: token stored in movie.token; /start <token> retrieves movie and enforces flow.
+- Force Join: checks configured channels via list_force_channels and get_chat_member; sends Join buttons + Try Again.
+- VIP vs Normal: VIP bypasses waiting ads; normal users see waiting ad (latest waiting ad from DB) and get sent video segments after WAIT_AD_SECONDS.
+- Poster + caption displayed, with inline menu buttons (you should replace channel links with real ones).
+- Message copying: uses copy_message(STORAGE_CHAT_ID, message_id) — this keeps Telegram servers delivering the file, not your server.
+- Admin dashboard stub via /dashboard that shows inline options.
+
+Notes and next steps / improvements you might want
+- Add proper conversation flows (state machine) for richer admin interactions and file uploads.
+- Add pagination, better error handling, logging, and rate-limiting to avoid Telegram limits.
+- Add protection for broadcast (confirmation step).
+- Protect owner-only commands; I used OWNER_ID check, but consider an admins table.
+- Consider storing full channel invite info automatically by asking the bot to export links.
+- Consider optimizing copy speed and handling for very large lists (queue worker).
+
+If you want, I can:
+- Expand the admin dashboard to be fully interactive (button-driven).
+- Convert DB layer to SQLAlchemy for schema migrations.
+- Add an admin web dashboard.
+- Implement an upload helper that parses ranges automatically from Storage Group forwarded messages (so admin can forward a range and bot auto-detects).
+Tell me which next feature to expand and I will provide updated files or a patch.
